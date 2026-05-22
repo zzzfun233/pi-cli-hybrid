@@ -1,0 +1,4294 @@
+==================================================
+BLANK AI CORE SYNCHRONIZATION FILE
+==================================================
+
+## FILE: package.json
+{
+  "name": "react-example",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "vite --port=37123 --strictPort --host=0.0.0.0",
+    "electron:dev": "concurrently -k \"npm run dev\" \"cross-env ELECTRON_START_URL=http://localhost:37123 electron .\"",
+    "electron:build": "npm run build && electron-builder",
+    "build": "vite build",
+    "preview": "vite preview",
+    "clean": "node -e \"const fs=require('fs'); for (const p of ['dist','server.js']) fs.rmSync(p,{recursive:true,force:true});\"",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@google/genai": "^1.29.0",
+    "@tailwindcss/vite": "^4.1.14",
+    "@vitejs/plugin-react": "^5.0.4",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "dotenv": "^17.4.2",
+    "express": "^4.21.2",
+    "lucide-react": "^0.546.0",
+    "motion": "^12.23.24",
+    "node-pty": "^1.1.0",
+    "react": "^19.0.1",
+    "react-dom": "^19.0.1",
+    "react-markdown": "^10.1.0",
+    "react-syntax-highlighter": "^16.1.1",
+    "remark-gfm": "^4.0.1",
+    "vite": "^6.2.3"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.14.0",
+    "@types/react-syntax-highlighter": "^15.5.13",
+    "autoprefixer": "^10.4.21",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "electron": "^42.1.0",
+    "electron-builder": "^26.8.1",
+    "esbuild": "^0.25.0",
+    "tailwindcss": "^4.1.14",
+    "tsx": "^4.21.0",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.3"
+  }
+}
+
+## FILE: vite.config.ts
+import tailwindcss from '@tailwindcss/vite';
+import react from '@vitejs/plugin-react';
+import path from 'path';
+import {defineConfig, loadEnv} from 'vite';
+import fs from 'fs';
+
+export default defineConfig(({mode}) => {
+  const env = loadEnv(mode, '.', '');
+  return {
+    root: fs.realpathSync.native(path.resolve('./')),
+    base: './',
+    plugins: [react(), tailwindcss()],
+    define: {
+      'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
+    },
+    resolve: {
+      alias: {
+        '@': path.resolve(__dirname, '.'),
+      },
+    },
+    server: {
+      // HMR is disabled in AI Studio via DISABLE_HMR env var.
+      // Do not modify—file watching is disabled to prevent flickering during agent edits.
+      hmr: process.env.DISABLE_HMR !== 'true',
+      // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
+      watch: process.env.DISABLE_HMR === 'true' ? null : {},
+    },
+  };
+});
+
+## FILE: tsconfig.json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "experimentalDecorators": true,
+    "useDefineForClassFields": false,
+    "module": "ESNext",
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "allowJs": true,
+    "jsx": "react-jsx",
+    "paths": {
+      "@/*": [
+        "./*"
+      ]
+    },
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  }
+}
+
+## FILE: electron/main.cjs
+`
+const { app, BrowserWindow, ipcMain, dialog, shell, clipboard } = require('electron');
+const path = require('path');
+const os = require('os');
+const fs = require('fs');
+const { spawn } = require('child_process');
+const dotenv = require('dotenv');
+const pty = require('node-pty');
+
+dotenv.config({ path: path.join(__dirname, '../.env') });
+
+let mainWindow;
+let ptyProcess;
+let currentWorkspacePath = null;
+let currentSessionFile = null;
+let sessionWatcher = null;
+let sessionDirWatcher = null;
+
+// ─── Fetch available models via CLI --list-models ────────────────
+function fetchAvailableModels() {
+  return new Promise((resolve) => {
+    const cliPath = path.resolve(process.env.PI_AGENT_CLI_PATH || 'D:/pi-agent/packages/coding-agent/dist/cli.js');
+    if (!fs.existsSync(cliPath)) {
+      resolve([]);
+      return;
+    }
+
+    const shell = process.platform === 'win32' ? 'node.exe' : 'node';
+    const child = spawn(shell, [cliPath, '--list-models'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+      timeout: 15000,
+    });
+
+    let stderr = '';
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+
+    child.on('close', () => {
+      const lines = stderr.split('\n').filter(Boolean);
+      if (lines.length < 2) { resolve([]); return; }
+
+      // Parse fixed-width table: provider / model / context / max-out / thinking / images
+      const header = lines[0];
+      const colStarts = [
+        header.indexOf('provider'),
+        header.indexOf('model'),
+        header.indexOf('context'),
+        header.indexOf('max-out'),
+        header.indexOf('thinking'),
+        header.indexOf('images'),
+      ].filter(i => i >= 0);
+
+      const models = [];
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i];
+        if (colStarts.length < 2) continue;
+        const provider = line.slice(colStarts[0], colStarts[1]).trim();
+        const modelId = line.slice(colStarts[1], colStarts[2] || line.length).trim();
+        if (!provider || !modelId) continue;
+        models.push({ id: modelId, name: modelId, provider });
+      }
+      resolve(models);
+    });
+
+    child.on('error', () => resolve([]));
+  });
+}
+
+// ─── Notify renderer ───────────────────────────────────────────────
+function notifyRenderer(channel, data) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send(channel, data);
+  }
+}
+
+function quoteEnvValue(value) {
+  return JSON.stringify(String(value ?? ''));
+}
+
+// ─── Session JSONL parsing ─────────────────────────────────────────
+function getSessionDir(cwd) {
+  // Pi CLI encodes the path into the session dir name
+  // e.g. D:\PyriteLab -> --D--PyriteLab--
+  const encoded = cwd.replace(/[^a-zA-Z0-9]/g, '-');
+  return path.join(os.homedir(), '.pi', 'agent', 'sessions', '--' + encoded + '--');
+}
+
+function parseSessionLine(line) {
+  try {
+    return JSON.parse(line);
+  } catch {
+    return null;
+  }
+}
+
+function extractMessagesFromSession(filePath) {
+  if (!fs.existsSync(filePath)) return [];
+  const lines = fs.readFileSync(filePath, 'utf8').split('\n').filter(Boolean);
+  const messages = [];
+
+  for (const line of lines) {
+    const entry = parseSessionLine(line);
+    if (!entry) continue;
+
+    if (entry.type === 'message') {
+      const { role, content } = entry.message;
+      if (role === 'user') {
+        const text = Array.isArray(content)
+          ? content.filter(c => c.type === 'text').map(c => c.text).join('\n')
+          : (typeof content === 'string' ? content : '');
+        messages.push({ role: 'user', text, timestamp: entry.timestamp });
+      } else if (role === 'assistant') {
+        const blocks = Array.isArray(content) ? content : [];
+        let thinking = '';
+        let text = '';
+        const toolCalls = [];
+
+        for (const block of blocks) {
+          if (block.type === 'thinking') {
+            thinking += block.thinking || '';
+          } else if (block.type === 'text') {
+            text += block.text || '';
+          } else if (block.type === 'toolCall') {
+            toolCalls.push({
+              id: block.id,
+              name: block.name,
+              arguments: block.arguments
+            });
+          }
+        }
+
+        messages.push({
+          role: 'assistant',
+          text,
+          thinking,
+          toolCalls,
+          timestamp: entry.timestamp,
+          model: entry.message.model,
+          provider: entry.message.provider,
+          usage: entry.message.usage
+        });
+      } else if (role === 'toolResult') {
+        const resultText = Array.isArray(entry.message.content)
+          ? entry.message.content.filter(c => c.type === 'text').map(c => c.text).join('\n')
+          : '';
+        messages.push({
+          role: 'toolResult',
+          toolCallId: entry.message.toolCallId,
+          toolName: entry.message.toolName,
+          text: resultText,
+          isError: entry.message.isError,
+          timestamp: entry.timestamp
+        });
+      }
+    }
+  }
+
+  return messages;
+}
+
+// ─── Session model/thinking extraction ────────────────────────────
+function extractModelAndThinking(filePath) {
+  if (!fs.existsSync(filePath)) return {};
+  const lines = fs.readFileSync(filePath, 'utf8').split('\n').filter(Boolean);
+  let model = null;
+  let thinkingLevel = null;
+
+  for (const line of lines) {
+    const entry = parseSessionLine(line);
+    if (!entry) continue;
+    if (entry.type === 'model_change') {
+      model = { id: entry.modelId, provider: entry.provider };
+    } else if (entry.type === 'thinking_level_change') {
+      thinkingLevel = entry.thinkingLevel;
+    }
+  }
+
+  return { model, thinkingLevel };
+}
+
+// ─── Session file watcher ──────────────────────────────────────────
+function startSessionWatcher(cwd) {
+  stopSessionWatcher();
+
+  const sessionDir = getSessionDir(cwd);
+  if (!fs.existsSync(sessionDir)) {
+    // Session dir might not exist yet, watch for its creation
+    const parentDir = path.join(os.homedir(), '.pi', 'agent', 'sessions');
+    if (fs.existsSync(parentDir)) {
+      sessionDirWatcher = fs.watch(parentDir, (eventType, filename) => {
+        if (filename && filename.includes(path.basename(sessionDir).slice(0, 20))) {
+          startSessionWatcher(cwd); // Re-watch once the dir exists
+        }
+      });
+    }
+    return;
+  }
+
+  // Find the latest session file
+  const files = fs.readdirSync(sessionDir)
+    .filter(f => f.endsWith('.jsonl'))
+    .sort()
+    .reverse();
+
+  if (files.length > 0) {
+    const latestFile = path.join(sessionDir, files[0]);
+    watchSessionFile(latestFile);
+  }
+
+  // Watch for new session files
+  sessionDirWatcher = fs.watch(sessionDir, (eventType, filename) => {
+    if (filename && filename.endsWith('.jsonl')) {
+      const newFile = path.join(sessionDir, filename);
+      if (eventType === 'rename' && fs.existsSync(newFile)) {
+        // New session file created
+        watchSessionFile(newFile);
+      }
+    }
+  });
+}
+
+function watchSessionFile(filePath) {
+  if (currentSessionFile === filePath) return;
+  stopSessionFileWatcher();
+
+  currentSessionFile = filePath;
+  console.log(`[Session Watcher] Watching: ${filePath}`);
+
+  // Send initial messages from the session
+  const messages = extractMessagesFromSession(filePath);
+  notifyRenderer('session-messages', { sessionId: path.basename(filePath, '.jsonl'), messages });
+
+  // Send initial model/thinking state from session
+  const { model, thinkingLevel } = extractModelAndThinking(filePath);
+  if (model) notifyRenderer('session-model-change', model);
+  if (thinkingLevel) notifyRenderer('session-thinking-level-change', { thinkingLevel });
+
+  // Watch for changes
+  let lastSize = 0;
+  try {
+    const stat = fs.statSync(filePath);
+    lastSize = stat.size;
+  } catch {}
+
+  sessionWatcher = fs.watch(filePath, (eventType) => {
+    if (eventType === 'change') {
+      try {
+        const stat = fs.statSync(filePath);
+        if (stat.size > lastSize) {
+          // Read only the new bytes
+          const fd = fs.openSync(filePath, 'r');
+          const buffer = Buffer.alloc(stat.size - lastSize);
+          fs.readSync(fd, buffer, 0, buffer.length, lastSize);
+          fs.closeSync(fd);
+          lastSize = stat.size;
+
+          const newLines = buffer.toString('utf8').split('\n').filter(Boolean);
+          for (const line of newLines) {
+            const entry = parseSessionLine(line);
+            if (!entry) continue;
+            if (entry.type === 'message') {
+              notifyRenderer('session-entry', { ...entry, _sessionId: path.basename(currentSessionFile, '.jsonl') });
+            } else if (entry.type === 'model_change') {
+              notifyRenderer('session-model-change', { id: entry.modelId, provider: entry.provider });
+            } else if (entry.type === 'thinking_level_change') {
+              notifyRenderer('session-thinking-level-change', { thinkingLevel: entry.thinkingLevel });
+            }
+          }
+        } else if (stat.size < lastSize) {
+          // File was truncated (new session), re-read everything
+          lastSize = stat.size;
+          const messages = extractMessagesFromSession(filePath);
+          notifyRenderer('session-messages', {
+            sessionId: path.basename(filePath, '.jsonl'),
+            messages
+          });
+        }
+      } catch (err) {
+        console.error('[Session Watcher] Error reading session file:', err.message);
+      }
+    }
+  });
+}
+
+function stopSessionFileWatcher() {
+  if (sessionWatcher) {
+    sessionWatcher.close();
+    sessionWatcher = null;
+  }
+  currentSessionFile = null;
+}
+
+function stopSessionWatcher() {
+  stopSessionFileWatcher();
+  if (sessionDirWatcher) {
+    sessionDirWatcher.close();
+    sessionDirWatcher = null;
+  }
+}
+
+// ─── PTY management ───────────────────────────────────────────────
+function startPtyProcess(cwd) {
+  if (ptyProcess) {
+    ptyProcess.kill();
+    ptyProcess = null;
+  }
+
+  stopSessionWatcher();
+
+  const cliPath = path.resolve(process.env.PI_AGENT_CLI_PATH || 'D:/pi-agent/packages/coding-agent/dist/cli.js');
+
+  if (!fs.existsSync(cliPath)) {
+    const error = `Pi Agent CLI not found: ${cliPath}. Set PI_AGENT_CLI_PATH in .env.`;
+    console.error(error);
+    notifyRenderer('pi-agent-error', error);
+    return false;
+  }
+
+  // Ensure the session directory exists before starting
+  const sessionDir = getSessionDir(cwd);
+  if (!fs.existsSync(sessionDir)) {
+    fs.mkdirSync(sessionDir, { recursive: true });
+  }
+
+  // Get the latest session to decide whether to --continue
+  let latestSessionId = null;
+  try {
+    const files = fs.readdirSync(sessionDir)
+      .filter(f => f.endsWith('.jsonl'))
+      .sort()
+      .reverse();
+    if (files.length > 0) {
+      // Extract session ID from filename: ..._<uuid>.jsonl
+      const match = files[0].match(/_([0-9a-f-]+)\.jsonl$/);
+      if (match) latestSessionId = match[1];
+    }
+  } catch {}
+
+  const args = [cliPath];
+  // Start in default interactive mode (text TUI)
+  // Use --continue to resume the last session if it exists
+  if (latestSessionId) {
+    args.push('--session', latestSessionId);
+  }
+
+  const shell = process.platform === 'win32' ? 'node.exe' : 'node';
+
+  try {
+    ptyProcess = pty.spawn(shell, args, {
+      name: 'xterm-256color',
+      cols: 120,
+      rows: 30,
+      cwd,
+      useConpty: false,
+      env: {
+        ...process.env,
+        FORCE_COLOR: '1',
+      }
+    });
+  } catch (err) {
+    console.error('Failed to spawn PTY:', err);
+    notifyRenderer('pi-agent-error', `Failed to spawn PTY: ${err.message}`);
+    return false;
+  }
+
+  console.log(`[PTY] Spawned pi interactive (PID: ${ptyProcess.pid})`);
+
+  // Forward PTY output to renderer
+  ptyProcess.onData((data) => {
+    notifyRenderer('pty-data', data);
+  });
+
+  ptyProcess.onExit(({ exitCode }) => {
+    console.log(`[PTY] Process exited with code ${exitCode}`);
+    ptyProcess = null;
+    notifyRenderer('pty-exit', { code: exitCode });
+  });
+
+  // Start watching the session directory for messages
+  // Small delay to let the CLI initialize and create/update the session
+  setTimeout(() => {
+    startSessionWatcher(cwd);
+  }, 2000);
+
+  return true;
+}
+
+// ─── IPC Handlers ──────────────────────────────────────────────────
+
+// PTY data input (from xterm.js)
+ipcMain.on('pty-input', (event, data) => {
+  if (ptyProcess) {
+    ptyProcess.write(data);
+  }
+});
+
+// PTY resize
+ipcMain.on('pty-resize', (event, { cols, rows }) => {
+  if (ptyProcess) {
+    try {
+      ptyProcess.resize(cols, rows);
+    } catch (err) {
+      console.error('[PTY] Resize error:', err.message);
+    }
+  }
+});
+
+// Send a prompt to the PTY (chat input)
+ipcMain.handle('send-prompt', async (event, data) => {
+  if (ptyProcess) {
+    // Write the text followed by Enter to the PTY
+    ptyProcess.write(data + '\r');
+    return { success: true };
+  }
+  return { success: false, error: 'PTY is not running' };
+});
+
+// Send raw keybinding to the PTY (for programmatic shortcuts)
+ipcMain.handle('send-keybinding', async (event, keyName) => {
+  if (!ptyProcess) return { success: false, error: 'PTY is not running' };
+  const keyMap = {
+    'model-cycle': '\x10',        // Ctrl+P
+    'thinking-cycle': '\x1b[Z',   // Shift+Tab
+  };
+  const seq = keyMap[keyName];
+  if (!seq) return { success: false, error: `Unknown keybinding: ${keyName}` };
+  ptyProcess.write(seq);
+  return { success: true };
+});
+
+// Get session messages (for initial load)
+ipcMain.handle('get-session-messages', async () => {
+  if (currentSessionFile && fs.existsSync(currentSessionFile)) {
+    return extractMessagesFromSession(currentSessionFile);
+  }
+  return [];
+});
+
+// PTY status
+ipcMain.handle('get-pty-status', async () => {
+  return {
+    running: !!ptyProcess,
+    pid: ptyProcess?.pid || null,
+    workspace: currentWorkspacePath
+  };
+});
+
+// Start PTY on-demand (called when terminal mounts)
+ipcMain.handle('start-pty', async () => {
+  if (ptyProcess) return { success: true, pid: ptyProcess.pid };
+  const cwd = currentWorkspacePath || os.homedir();
+  const ok = startPtyProcess(cwd);
+  return { success: ok };
+});
+
+// Stop PTY (called when terminal unmounts)
+ipcMain.handle('stop-pty', async () => {
+  if (ptyProcess) {
+    ptyProcess.kill();
+    ptyProcess = null;
+  }
+  stopSessionWatcher();
+  return { success: true };
+});
+
+// Fetch available models from CLI
+ipcMain.handle('get-available-models', async () => {
+  return fetchAvailableModels();
+});
+
+// Workspace management
+ipcMain.handle('select-workspace-folder', async () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return null;
+
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: '选择工作区文件夹',
+    properties: ['openDirectory']
+  });
+
+  if (result.canceled || result.filePaths.length === 0) return null;
+
+  const folderPath = path.resolve(result.filePaths[0]);
+  if (currentWorkspacePath !== folderPath) {
+    currentWorkspacePath = folderPath;
+    startPtyProcess(folderPath);
+  }
+
+  return {
+    path: folderPath,
+    name: path.basename(folderPath) || folderPath
+  };
+});
+
+ipcMain.handle('set-workspace-folder', async (event, folderPath) => {
+  if (!folderPath || typeof folderPath !== 'string') return { success: false };
+  try {
+    const resolvedPath = path.resolve(folderPath);
+    const stat = fs.statSync(resolvedPath);
+    if (!stat.isDirectory()) return { success: false };
+
+    if (currentWorkspacePath !== resolvedPath) {
+      currentWorkspacePath = resolvedPath;
+      startPtyProcess(resolvedPath);
+    }
+    return { success: true, path: resolvedPath, name: path.basename(resolvedPath) || resolvedPath };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('reveal-workspace-folder', async () => {
+  if (!currentWorkspacePath) return { success: false };
+  const error = await shell.openPath(currentWorkspacePath);
+  return { success: !error, error };
+});
+
+// Restart PTY (for workspace change or manual restart)
+ipcMain.handle('restart-pty', async () => {
+  const cwd = currentWorkspacePath || os.homedir();
+  return startPtyProcess(cwd);
+});
+
+// Clipboard
+ipcMain.handle('clipboard-read-text', async () => clipboard.readText());
+ipcMain.handle('clipboard-write-text', async (event, text) => {
+  clipboard.writeText(typeof text === 'string' ? text : '');
+  return true;
+});
+
+// File upload
+ipcMain.handle('save-uploaded-file', async (event, name, base64Data) => {
+  try {
+    const buffer = Buffer.from(base64Data, 'base64');
+    const baseDir = currentWorkspacePath || os.homedir();
+    const uploadDir = path.join(baseDir, '.uploaded_files');
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    const safeName = path.basename(typeof name === 'string' ? name : 'upload.bin');
+    const filePath = path.join(uploadDir, safeName);
+    fs.writeFileSync(filePath, buffer);
+    console.log(`[File Upload] Saved: ${filePath}`);
+    return { success: true, path: filePath };
+  } catch (error) {
+    console.error('Failed to save uploaded file:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Env management
+ipcMain.handle('get-env', async () => {
+  try {
+    const envPath = path.join(__dirname, '../.env');
+    if (!fs.existsSync(envPath)) return {};
+    return dotenv.parse(fs.readFileSync(envPath, 'utf8'));
+  } catch (error) {
+    console.error('Failed to read .env file:', error);
+    return {};
+  }
+});
+
+ipcMain.handle('save-env', async (event, envVars) => {
+  try {
+    const envPath = path.join(__dirname, '../.env');
+    let content = '';
+    if (fs.existsSync(envPath)) {
+      content = fs.readFileSync(envPath, 'utf8');
+    }
+
+    const lines = content.split('\n');
+    const updatedKeys = new Set();
+
+    const newLines = lines.map(line => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) return line;
+      const idx = trimmed.indexOf('=');
+      if (idx > 0) {
+        const key = trimmed.slice(0, idx).trim();
+        if (envVars.hasOwnProperty(key)) {
+          updatedKeys.add(key);
+          return `${key}=${quoteEnvValue(envVars[key])}`;
+        }
+      }
+      return line;
+    });
+
+    Object.entries(envVars).forEach(([key, val]) => {
+      if (!updatedKeys.has(key)) {
+        newLines.push(`${key}=${quoteEnvValue(val)}`);
+      }
+      process.env[key] = val;
+    });
+
+    fs.writeFileSync(envPath, newLines.join('\n'), 'utf8');
+    console.log(`[Env Sync] Updated .env: ${Object.keys(envVars).join(', ')}`);
+
+    // Restart PTY to apply new env
+    console.log('[Env Sync] Restarting PTY...');
+    const cwd = currentWorkspacePath || os.homedir();
+    startPtyProcess(cwd);
+
+    return { success: true };
+  } catch (error) {
+    console.error('Failed to save .env file:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Skills sync
+ipcMain.handle('sync-skills', async (event, skills) => {
+  try {
+    const homedir = os.homedir();
+    const skillsDir = path.join(homedir, '.pi', 'agent', 'skills');
+
+    if (!fs.existsSync(skillsDir)) {
+      fs.mkdirSync(skillsDir, { recursive: true });
+    }
+
+    const prefix = 'blankai-';
+    const activeCleanNames = new Set();
+
+    for (const skill of skills) {
+      let baseCleanName = skill.name
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '');
+
+      if (!baseCleanName) {
+        baseCleanName = `skill-${skill.id}`;
+      }
+
+      const cleanName = `${prefix}${baseCleanName}`;
+      const skillPath = path.join(skillsDir, cleanName);
+
+      if (skill.enabled) {
+        activeCleanNames.add(cleanName);
+
+        if (!fs.existsSync(skillPath)) {
+          fs.mkdirSync(skillPath, { recursive: true });
+        }
+
+        const skillMdContent = `---
+name: ${cleanName}
+description: ${skill.description || 'Custom Skill'}
+---
+${skill.content || ''}
+`;
+
+        fs.writeFileSync(path.join(skillPath, 'SKILL.md'), skillMdContent, 'utf8');
+      }
+    }
+
+    if (fs.existsSync(skillsDir)) {
+      const folders = fs.readdirSync(skillsDir);
+      for (const folder of folders) {
+        if (folder.startsWith(prefix) && !activeCleanNames.has(folder)) {
+          const folderPath = path.join(skillsDir, folder);
+          fs.rmSync(folderPath, { recursive: true, force: true });
+          console.log(`[Skills Sync] Cleaned up: ${folder}`);
+        }
+      }
+    }
+
+    console.log(`[Skills Sync] Synced ${activeCleanNames.size} skills.`);
+    return { success: true, count: activeCleanNames.size };
+  } catch (error) {
+    console.error('Failed to sync skills:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// ─── Window creation ───────────────────────────────────────────────
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 1000,
+    height: 800,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      nodeIntegration: false,
+      contextIsolation: true
+    },
+    titleBarStyle: 'hidden',
+    titleBarOverlay: {
+      color: '#ffffff',
+      symbolColor: '#74b1be',
+      height: 35
+    }
+  });
+
+  const startUrl = process.env.ELECTRON_START_URL || `file://${path.join(__dirname, '../dist/index.html')}`;
+  mainWindow.loadURL(startUrl);
+
+  mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL) => {
+    if (validatedURL === startUrl) {
+      console.log(`[Electron Loader] Load failed (${errorDescription}). Retrying in 1s...`);
+      setTimeout(() => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.loadURL(startUrl);
+        }
+      }, 1000);
+    }
+  });
+
+  if (process.env.NODE_ENV === 'development') {
+    mainWindow.webContents.openDevTools();
+  }
+}
+
+// ─── App lifecycle ─────────────────────────────────────────────────
+app.whenReady().then(() => {
+  createWindow();
+  const cwd = currentWorkspacePath || os.homedir();
+  startPtyProcess(cwd);
+
+  app.on('activate', function () {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
+});
+
+app.on('window-all-closed', function () {
+  if (process.platform !== 'darwin') app.quit();
+});
+
+app.on('before-quit', () => {
+  stopSessionWatcher();
+  if (ptyProcess) {
+    ptyProcess.kill();
+  }
+});
+
+`
+## FILE: electron/preload.cjs
+const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('api', {
+  // ─── PTY Terminal ───────────────────────────────────────
+  ptyInput: (data) => ipcRenderer.send('pty-input', data),
+  ptyResize: (cols, rows) => ipcRenderer.send('pty-resize', { cols, rows }),
+  onPtyData: (callback) => {
+    const subscription = (event, data) => callback(data);
+    ipcRenderer.on('pty-data', subscription);
+    return () => ipcRenderer.removeListener('pty-data', subscription);
+  },
+  onPtyExit: (callback) => {
+    const subscription = (event, data) => callback(data);
+    ipcRenderer.on('pty-exit', subscription);
+    return () => ipcRenderer.removeListener('pty-exit', subscription);
+  },
+
+  // ─── Chat / Prompts ────────────────────────────────────
+  sendPrompt: (text) => ipcRenderer.invoke('send-prompt', text),
+  getSessionMessages: () => ipcRenderer.invoke('get-session-messages'),
+  onSessionMessages: (callback) => {
+    const subscription = (event, data) => callback(data);
+    ipcRenderer.on('session-messages', subscription);
+    return () => ipcRenderer.removeListener('session-messages', subscription);
+  },
+  onSessionEntry: (callback) => {
+    const subscription = (event, data) => callback(data);
+    ipcRenderer.on('session-entry', subscription);
+    return () => ipcRenderer.removeListener('session-entry', subscription);
+  },
+  onSessionModelChange: (callback) => {
+    const subscription = (event, data) => callback(data);
+    ipcRenderer.on('session-model-change', subscription);
+    return () => ipcRenderer.removeListener('session-model-change', subscription);
+  },
+  onSessionThinkingLevelChange: (callback) => {
+    const subscription = (event, data) => callback(data);
+    ipcRenderer.on('session-thinking-level-change', subscription);
+    return () => ipcRenderer.removeListener('session-thinking-level-change', subscription);
+  },
+  // ─── PTY Status ────────────────────────────────────────
+  getPtyStatus: () => ipcRenderer.invoke('get-pty-status'),
+  restartPty: () => ipcRenderer.invoke('restart-pty'),
+  sendKeybinding: (keyName) => ipcRenderer.invoke('send-keybinding', keyName),
+  getAvailableModels: () => ipcRenderer.invoke('get-available-models'),
+
+  // ─── Legacy RPC mode (kept as fallback) ────────────────
+  sendPiCommand: (command) => ipcRenderer.invoke('send-pi-command', typeof command === 'string' ? command : JSON.stringify(command)),
+  onPiMessage: (callback) => {
+    const subscription = (event, data) => callback(data);
+    ipcRenderer.on('pi-agent-message', subscription);
+    return () => ipcRenderer.removeListener('pi-agent-message', subscription);
+  },
+
+  // ─── Workspace ─────────────────────────────────────────
+  selectWorkspaceFolder: () => ipcRenderer.invoke('select-workspace-folder'),
+  setWorkspaceFolder: (folderPath) => ipcRenderer.invoke('set-workspace-folder', folderPath),
+  revealWorkspaceFolder: () => ipcRenderer.invoke('reveal-workspace-folder'),
+
+  // ─── Clipboard ─────────────────────────────────────────
+  readClipboardText: () => ipcRenderer.invoke('clipboard-read-text'),
+  writeClipboardText: (text) => ipcRenderer.invoke('clipboard-write-text', text),
+
+  // ─── File Upload ───────────────────────────────────────
+  saveUploadedFile: (name, base64Data) => ipcRenderer.invoke('save-uploaded-file', name, base64Data),
+
+  // ─── Environment ───────────────────────────────────────
+  getEnv: () => ipcRenderer.invoke('get-env'),
+  saveEnv: (envVars) => ipcRenderer.invoke('save-env', envVars),
+
+  // ─── Skills ────────────────────────────────────────────
+  syncSkills: (skills) => ipcRenderer.invoke('sync-skills', skills),
+
+  // ─── Error channel ─────────────────────────────────────
+  onPiAgentError: (callback) => {
+    const subscription = (event, data) => callback(data);
+    ipcRenderer.on('pi-agent-error', subscription);
+    return () => ipcRenderer.removeListener('pi-agent-error', subscription);
+  }
+});
+
+## FILE: src/main.tsx
+import {StrictMode} from 'react';
+import {createRoot} from 'react-dom/client';
+import App from './App.tsx';
+import './index.css';
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+);
+
+## FILE: src/App.tsx
+import React, { Suspense, lazy, useState, useEffect, useRef } from 'react';
+import { X, Plus, ArrowUp, PanelLeft, Search, Terminal, ChevronDown, Settings, ChevronLeft, ChevronRight, Clipboard, Scissors, Copy, MousePointer2, FolderOpen, FolderPlus, MoreVertical } from 'lucide-react';
+import type { ChatGroup, ChatSession, Message, ModelInfo, WorkspaceInfo } from './types';
+
+const SettingsPanel = lazy(() => import('./SettingsPanel'));
+const ChatMessage = lazy(() => import('./ChatMessage'));
+const XtermTerminal = lazy(() => import('./XtermTerminal'));
+
+type TerminalLogType = 'info' | 'success' | 'error' | 'input' | 'output';
+
+interface TerminalLog {
+  id: string;
+  type: TerminalLogType;
+  text: string;
+  timestamp: number;
+}
+
+const getRelativeTime = (timestamp: number) => {
+  const diff = Date.now() - timestamp;
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'now';
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  return `${days}d`;
+};
+
+export default function App() {
+  const showThinking = (() => {
+    try {
+      const stored = localStorage.getItem('blankAI_showThinking');
+      return stored ? JSON.parse(stored) !== false : true;
+    } catch {
+      return true;
+    }
+  })();
+
+  const [currentWorkspace, setCurrentWorkspace] = useState<WorkspaceInfo | null>(() => {
+    try {
+      const stored = localStorage.getItem('blankAI_currentWorkspace');
+      if (stored) {
+        const workspace = JSON.parse(stored);
+        if (workspace?.path && workspace?.name) return workspace;
+      }
+    } catch (e) {
+      console.error('Failed to parse blankAI_currentWorkspace on init:', e);
+    }
+    return null;
+  });
+
+  const [savedChats, setSavedChats] = useState<ChatSession[]>(() => {
+    try {
+      const saveHistory = localStorage.getItem('blankAI_saveHistory') !== 'false';
+      if (saveHistory) {
+        const stored = localStorage.getItem('blankAI_savedChats');
+        if (stored) {
+          const chats = JSON.parse(stored);
+          if (Array.isArray(chats)) return chats;
+        }
+      }
+    } catch (e) {
+      console.error('Failed to parse blankAI_savedChats on init:', e);
+    }
+    return [];
+  });
+
+  const [currentSessionId, setCurrentSessionId] = useState<number | null>(() => {
+    try {
+      const saveHistory = localStorage.getItem('blankAI_saveHistory') !== 'false';
+      if (saveHistory) {
+        const stored = localStorage.getItem('blankAI_savedChats');
+        if (stored) {
+          const chats = JSON.parse(stored);
+          if (Array.isArray(chats) && chats.length > 0) {
+            return chats[0].id;
+          }
+        }
+      }
+    } catch {}
+    return null;
+  });
+
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [inputText, setInputText] = useState('');
+  const [isTyping, setIsTyping] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+
+  // Terminal Mode States
+  const [showTerminalMode, setShowTerminalMode] = useState(false);
+  const [terminalInputText, setTerminalInputText] = useState('');
+  const [terminalLogs, setTerminalLogs] = useState<TerminalLog[]>(() => {
+    return [
+      { id: 'welcome-1', type: 'info', text: '========================================================================', timestamp: Date.now() },
+      { id: 'welcome-2', type: 'info', text: '                BLANK AI -- PI CLI DEV TERMINAL CONSOLE                 ', timestamp: Date.now() },
+      { id: 'welcome-3', type: 'info', text: '========================================================================', timestamp: Date.now() },
+      { id: 'welcome-4', type: 'info', text: 'Connected to backend: Pi Agent CLI (RPC mode)', timestamp: Date.now() },
+      { id: 'welcome-5', type: 'info', text: 'Interactive REPL active. Type messages below to prompt the agent directly.', timestamp: Date.now() },
+      { id: 'welcome-6', type: 'info', text: 'Type standard queries or programming requests to view real-time RPC streams.', timestamp: Date.now() },
+      { id: 'welcome-7', type: 'info', text: '', timestamp: Date.now() }
+    ];
+  });
+  const terminalEndRef = useRef<HTMLDivElement>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const [scrollState, setScrollState] = useState({ top: 0, max: 0, viewportRatio: 1 });
+
+  const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>(() => {
+    try {
+      const stored = localStorage.getItem('blankAI_collapsedGroups');
+      return stored ? JSON.parse(stored) : {};
+    } catch {
+      return {};
+    }
+  });
+
+  useEffect(() => {
+    localStorage.setItem('blankAI_collapsedGroups', JSON.stringify(collapsedGroups));
+  }, [collapsedGroups]);
+
+  const toggleGroupCollapse = (key: string) => {
+    setCollapsedGroups(prev => ({
+      ...prev,
+      [key]: !prev[key]
+    }));
+  };
+
+  // Persistence effect for savedChats
+  useEffect(() => {
+    try {
+      const saveHistory = localStorage.getItem('blankAI_saveHistory') !== 'false';
+      if (saveHistory) {
+        localStorage.setItem('blankAI_savedChats', JSON.stringify(savedChats));
+      } else {
+        localStorage.removeItem('blankAI_savedChats');
+      }
+    } catch (e) {
+      console.error('Failed to persist savedChats to localStorage:', e);
+    }
+  }, [savedChats]);
+  
+  // Model & Thinking States
+  const [models, setModels] = useState<ModelInfo[]>([]);
+  const [currentModel, setCurrentModel] = useState<ModelInfo | null>(null);
+  const [isModelDropdownOpen, setIsModelDropdownOpen] = useState(false);
+  const [thinkingLevel, setThinkingLevel] = useState<string>('high');
+  const [popoverView, setPopoverView] = useState<'main' | 'models'>('main');
+
+  // Translation helpers for thinking levels
+  const getThinkingLabel = (level: string) => {
+    const map: Record<string, string> = {
+      off: '关闭',
+      minimal: '极低',
+      low: '低',
+      medium: '中',
+      high: '高',
+      xhigh: '超高'
+    };
+    return map[level] || '高';
+  };
+
+  const getThinkingDesc = (level: string) => {
+    const map: Record<string, string> = {
+      off: '关闭推理，模型将直接进行响应',
+      minimal: '快速概述，极简的思考分析',
+      low: '轻度推理，适合简单的逻辑与分析',
+      medium: '标准推理，平衡思考速度与智力水平',
+      high: '深度推理，强烈推荐用于复杂编程与排错',
+      xhigh: '极限推理，最大化模型规划与自我纠错能力'
+    };
+    return map[level] || '';
+  };
+  
+  const chatAreaRef = useRef<HTMLDivElement>(null);
+  const scrollTrackRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const currentSessionIdRef = useRef<number | null>(null);
+  const activeAgentSessionIdRef = useRef<number | null>(null);
+  const currentWorkspaceRef = useRef<WorkspaceInfo | null>(currentWorkspace);
+  const lastResponseLogRef = useRef<string | null>(null);
+  const processedEntryIdsRef = useRef<Set<string>>(new Set());
+
+  const appendTerminalLog = (type: TerminalLogType, text: string) => {
+    setTerminalLogs(prev => {
+      const last = prev[prev.length - 1];
+      if (last?.type === type && last.text === text) return prev;
+
+      return [
+        ...prev,
+        { id: Math.random().toString(), type, text, timestamp: Date.now() }
+      ];
+    });
+  };
+
+  // Keep the ref in sync with currentSessionId
+  useEffect(() => {
+    currentSessionIdRef.current = currentSessionId;
+  }, [currentSessionId]);
+
+  useEffect(() => {
+    currentWorkspaceRef.current = currentWorkspace;
+    try {
+      if (currentWorkspace) {
+        localStorage.setItem('blankAI_currentWorkspace', JSON.stringify(currentWorkspace));
+      } else {
+        localStorage.removeItem('blankAI_currentWorkspace');
+      }
+    } catch (e) {
+      console.error('Failed to persist current workspace:', e);
+    }
+  }, [currentWorkspace]);
+
+  // Restore workspace and listen for PTY session state on mount
+  useEffect(() => {
+    const api = (window as any).api;
+    if (!api) return;
+
+    // Restore workspace folder
+    if (currentWorkspace?.path && api.setWorkspaceFolder) {
+      api.setWorkspaceFolder(currentWorkspace.path).catch((e: unknown) => {
+        console.error('Failed to restore workspace folder:', e);
+      });
+    }
+
+    // Fetch full model list from CLI
+    if (api.getAvailableModels) {
+      api.getAvailableModels().then((models: ModelInfo[]) => {
+        if (models.length > 0) setModels(models);
+      }).catch((e: unknown) => {
+        console.error('Failed to fetch models:', e);
+      });
+    }
+
+    // Listen for model changes from PTY session JSONL
+    const cleanups: (() => void)[] = [];
+
+    if (api.onSessionModelChange) {
+      const unsub = api.onSessionModelChange((data: { id: string; provider: string }) => {
+        const newModel: ModelInfo = { id: data.id, name: data.id, provider: data.provider };
+        setCurrentModel(newModel);
+      });
+      cleanups.push(unsub);
+    }
+
+    if (api.onSessionThinkingLevelChange) {
+      const unsub = api.onSessionThinkingLevelChange((data: { thinkingLevel: string }) => {
+        if (data.thinkingLevel) setThinkingLevel(data.thinkingLevel);
+      });
+      cleanups.push(unsub);
+    }
+
+    return () => cleanups.forEach(fn => fn());
+  }, []);
+
+  // Close model dropdown when clicking outside
+  useEffect(() => {
+    if (!isModelDropdownOpen) return;
+    const handleOutsideClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (!target.closest('.model-selector-container')) {
+        setIsModelDropdownOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutsideClick);
+    return () => document.removeEventListener('mousedown', handleOutsideClick);
+  }, [isModelDropdownOpen]);
+
+  const currentChat = savedChats.find(c => c.id === currentSessionId);
+  const messages = currentChat ? currentChat.messages : [];
+
+  const filteredChats = savedChats.filter(chat => 
+    chat.preview.toLowerCase().includes(searchQuery.toLowerCase()) || 
+    chat.messages.some(m => m.text.toLowerCase().includes(searchQuery.toLowerCase())) ||
+    (chat.workspaceName || '').toLowerCase().includes(searchQuery.toLowerCase())
+  );
+  const conversationTitle = currentChat?.preview || '新对话';
+  const activeWorkspaceName = currentChat?.workspaceName || currentWorkspace?.name || '';
+  const workspaceLabel = activeWorkspaceName || '空文件夹';
+  const chatGroups = filteredChats.reduce<ChatGroup[]>((groups, chat) => {
+    const groupPath = chat.workspacePath || null;
+    const key = groupPath || '__empty__';
+    let group = groups.find(item => item.key === key);
+
+    if (!group) {
+      group = {
+        key,
+        path: groupPath,
+        name: chat.workspaceName || '空文件夹',
+        chats: []
+      };
+      groups.push(group);
+    }
+
+    group.chats.push(chat);
+    return groups;
+  }, []);
+
+  if (currentWorkspace && !chatGroups.some(g => g.key === currentWorkspace.path)) {
+    chatGroups.push({
+      key: currentWorkspace.path,
+      path: currentWorkspace.path,
+      name: currentWorkspace.name,
+      chats: []
+    });
+  }
+
+  chatGroups.sort((a, b) => {
+    if (a.key === '__empty__') return -1;
+    if (b.key === '__empty__') return 1;
+    if (a.path === currentWorkspace?.path) return -1;
+    if (b.path === currentWorkspace?.path) return 1;
+    return a.name.localeCompare(b.name);
+  });
+
+  // Scroll to bottom when messages change or typing status changes
+  useEffect(() => {
+    if (chatAreaRef.current) {
+      chatAreaRef.current.scrollTop = chatAreaRef.current.scrollHeight;
+      updateScrollState();
+    }
+  }, [messages, isTyping]);
+
+  const updateScrollState = () => {
+    const el = chatAreaRef.current;
+    if (!el) return;
+
+    const max = Math.max(0, el.scrollHeight - el.clientHeight);
+    setScrollState({
+      top: Math.min(el.scrollTop, max),
+      max,
+      viewportRatio: el.scrollHeight > 0 ? Math.min(1, el.clientHeight / el.scrollHeight) : 1
+    });
+  };
+
+  const toggleSidebar = (show: boolean) => {
+    setIsSidebarOpen(show);
+  };
+
+  const loadChat = (id: number) => {
+    setCurrentSessionId(id);
+    const chat = savedChats.find(c => c.id === id);
+    if (chat) {
+      if (chat.workspacePath && chat.workspaceName) {
+        if (currentWorkspaceRef.current?.path !== chat.workspacePath) {
+          setCurrentWorkspace({ path: chat.workspacePath, name: chat.workspaceName });
+          const api = (window as any).api;
+          if (api && api.setWorkspaceFolder) {
+            api.setWorkspaceFolder(chat.workspacePath).catch(() => {});
+          }
+        }
+      } else {
+        setCurrentWorkspace(null);
+      }
+    }
+    if (window.innerWidth < 768) {
+      toggleSidebar(false);
+    }
+  };
+
+  const deleteChat = (e: React.MouseEvent, id: number) => {
+    e.stopPropagation();
+    setSavedChats(prev => prev.filter(c => c.id !== id));
+    if (currentSessionId === id) {
+      setCurrentSessionId(null);
+    }
+  };
+
+  const startNewChat = () => {
+    setCurrentWorkspace(null);
+    setCurrentSessionId(null);
+    setTimeout(() => {
+      inputRef.current?.focus();
+    }, 50);
+  };
+
+  const startNewChatInWorkspace = (workspacePath: string | null, workspaceName: string) => {
+    if (workspacePath) {
+      setCurrentWorkspace({ path: workspacePath, name: workspaceName });
+      const api = (window as any).api;
+      if (api && api.setWorkspaceFolder && currentWorkspaceRef.current?.path !== workspacePath) {
+        api.setWorkspaceFolder(workspacePath);
+      }
+    } else {
+      setCurrentWorkspace(null);
+    }
+    setCurrentSessionId(null);
+    setTimeout(() => {
+      inputRef.current?.focus();
+    }, 50);
+  };
+
+  const handleNewChatInWorkspace = (e: React.MouseEvent, path: string | null, name: string) => {
+    e.stopPropagation();
+    startNewChatInWorkspace(path, name);
+  };
+
+  const handleRevealGroupFolder = (e: React.MouseEvent, path: string | null) => {
+    e.stopPropagation();
+    if (!path) return;
+    const api = (window as any).api;
+    if (api && api.setWorkspaceFolder && api.revealWorkspaceFolder) {
+      api.setWorkspaceFolder(path).then(() => {
+        api.revealWorkspaceFolder();
+      });
+    }
+  };
+
+  const selectWorkspaceFolder = async () => {
+    const api = (window as any).api;
+    if (!api?.selectWorkspaceFolder) return;
+
+    const workspace = await api.selectWorkspaceFolder();
+    if (workspace?.path) {
+      setCurrentWorkspace(workspace);
+      setSearchQuery('');
+    }
+  };
+
+  const revealWorkspaceFolder = async () => {
+    const api = (window as any).api;
+    if (currentWorkspace && api?.revealWorkspaceFolder) {
+      await api.revealWorkspaceFolder();
+    }
+  };
+
+  const beginMessageScrollDrag = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    const chatEl = chatAreaRef.current;
+    const trackEl = scrollTrackRef.current;
+    if (!chatEl || !trackEl || scrollState.max <= 0) return;
+
+    e.preventDefault();
+    const startTop = chatEl.scrollTop;
+    const startMouseY = e.clientY;
+    const trackHeight = trackEl.clientHeight;
+    const thumbHeight = Math.max(36, trackHeight * scrollState.viewportRatio);
+    const movable = Math.max(1, trackHeight - thumbHeight);
+    const handleMouseMove = (moveEvent: MouseEvent) => {
+      const deltaRatio = (moveEvent.clientY - startMouseY) / movable;
+      chatEl.scrollTop = Math.max(0, Math.min(scrollState.max, startTop + deltaRatio * scrollState.max));
+      updateScrollState();
+    };
+    const handleMouseUp = () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+  };
+
+  const closeContextMenu = () => setContextMenu(null);
+
+  const handleMessageScrollTrackClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.target !== e.currentTarget) return;
+    const chatEl = chatAreaRef.current;
+    const trackEl = scrollTrackRef.current;
+    if (!chatEl || !trackEl || scrollState.max <= 0) return;
+
+    const rect = trackEl.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+    chatEl.scrollTo({ top: ratio * scrollState.max, behavior: 'smooth' });
+  };
+
+  const runInputMenuAction = async (action: 'cut' | 'copy' | 'paste' | 'selectAll' | 'clear') => {
+    const input = inputRef.current;
+    if (!input) return;
+
+    const api = (window as any).api;
+    const start = input.selectionStart ?? 0;
+    const end = input.selectionEnd ?? inputText.length;
+    const selectedText = inputText.slice(start, end);
+
+    if (action === 'copy' && selectedText && api?.writeClipboardText) {
+      await api.writeClipboardText(selectedText);
+    } else if (action === 'cut' && api?.writeClipboardText) {
+      if (selectedText) await api.writeClipboardText(selectedText);
+      setInputText(inputText.slice(0, start) + inputText.slice(end));
+      requestAnimationFrame(() => input.setSelectionRange(start, start));
+    } else if (action === 'paste' && api?.readClipboardText) {
+      const text = await api.readClipboardText();
+      const next = inputText.slice(0, start) + text + inputText.slice(end);
+      setInputText(next);
+      requestAnimationFrame(() => {
+        const caret = start + text.length;
+        input.focus();
+        input.setSelectionRange(caret, caret);
+      });
+    } else if (action === 'selectAll') {
+      input.focus();
+      input.select();
+    } else if (action === 'clear') {
+      setInputText('');
+      requestAnimationFrame(() => input.focus());
+    }
+
+    closeContextMenu();
+  };
+
+  const toggleMessageHistory = (sessionId: number, messageId: string | undefined, index: number) => {
+    setSavedChats(prevChats => prevChats.map(chat => {
+      if (chat.id === sessionId) {
+        const newMessages = chat.messages.map((m, idx) => {
+          if ((m.id && m.id === messageId) || (!m.id && idx === index)) {
+            return { ...m, isHistoryOpen: !m.isHistoryOpen };
+          }
+          return m;
+        });
+        return { ...chat, messages: newMessages };
+      }
+      return chat;
+    }));
+  };
+
+  // Register IPC listener (only once on mount to avoid stale closures and redundant listeners)
+  useEffect(() => {
+    const api = (window as any).api;
+
+    const addLog = appendTerminalLog;
+
+    if (api && api.onPiMessage) {
+      const removeListener = api.onPiMessage((data: any) => {
+        // Handle model updates (these do not require an active chat session ID)
+        if (data.type === 'response' && data.success === true) {
+          if (data.command === 'get_state' && data.data) {
+            if (data.data.model) setCurrentModel(data.data.model);
+            if (data.data.thinkingLevel) setThinkingLevel(data.data.thinkingLevel);
+            addLog('info', `[System State] Loaded configuration. Active model: ${data.data.model?.id || 'none'}, Thinking: ${data.data.thinkingLevel}`);
+            return;
+          } else if (data.command === 'get_available_models' && data.data?.models) {
+            setModels(data.data.models);
+            addLog('info', `[System State] Fetched ${data.data.models.length} available models.`);
+            return;
+          } else if (data.command === 'set_model' && data.data) {
+            setCurrentModel(data.data);
+            addLog('success', `[Model Switch] Model changed to: ${data.data.id}`);
+            return;
+          } else if (data.command === 'cycle_model' && data.data?.model) {
+            setCurrentModel(data.data.model);
+            addLog('success', `[Model Cycle] Model cycled to: ${data.data.model.id}`);
+            return;
+          } else if (data.command === 'set_thinking_level') {
+            return;
+          }
+        }
+
+        const activeSessionId = activeAgentSessionIdRef.current ?? currentSessionIdRef.current;
+        if (!activeSessionId) return;
+
+        if (data.type === 'response' && data.success === false) {
+          // Display the RPC error to the user
+          setIsTyping(false);
+          addLog('error', `[RPC Error] ${data.error || 'Unknown error'}`);
+          setSavedChats(prevChats => prevChats.map(chat => {
+            if (chat.id === activeSessionId) {
+              const errId = Math.random().toString(36).substring(2, 9);
+              return { ...chat, messages: [...chat.messages, { id: errId, text: `[Error]: ${data.error || 'Unknown error'}`, sender: 'ai' }] };
+            }
+            return chat;
+          }));
+        } else if (data.type === 'message_start' && data.message?.role === 'assistant') {
+          setIsTyping(false);
+          addLog('info', `[Pi Agent] 💬 Responding...`);
+          setSavedChats(prevChats => prevChats.map(chat => {
+            if (chat.id === activeSessionId) {
+              const lastMsg = chat.messages[chat.messages.length - 1];
+              // If the last message is from AI and has final text, start a new message bubble
+              if (lastMsg && lastMsg.sender === 'ai' && lastMsg.text) {
+                const newAiId = Math.random().toString(36).substring(2, 9);
+                return { ...chat, messages: [...chat.messages, { id: newAiId, text: '', thinking: '', sender: 'ai' }] };
+              }
+              // If it has no final text (tool turns), reset thinking process for the new turn to prevent cluttering repeats!
+              if (lastMsg && lastMsg.sender === 'ai') {
+                const newMessages = chat.messages.map((m, idx) => {
+                  if (idx === chat.messages.length - 1) {
+                    const updatedHistory = [...(m.history || [])];
+                    if (m.thinking) {
+                      updatedHistory.push({ type: 'thinking', content: m.thinking });
+                    }
+                    return { ...m, thinking: '', status: '', history: updatedHistory };
+                  }
+                  return m;
+                });
+                return { ...chat, messages: newMessages };
+              }
+              const newAiId = Math.random().toString(36).substring(2, 9);
+              return { ...chat, messages: [...chat.messages, { id: newAiId, text: '', thinking: '', sender: 'ai' }] };
+            }
+            return chat;
+          }));
+        } else if (data.type === 'message_update') {
+          const { assistantMessageEvent } = data;
+          if (assistantMessageEvent) {
+            setIsTyping(false);
+            setSavedChats(prevChats => prevChats.map(chat => {
+              if (chat.id === activeSessionId) {
+                // Safely clone messages array and clone the last AI message object to ensure immutability and absolute purity
+                const newMessages = chat.messages.map((m, idx) => {
+                  if (idx === chat.messages.length - 1 && m.sender === 'ai') {
+                    return { ...m };
+                  }
+                  return m;
+                });
+                
+                let lastMsg = newMessages[newMessages.length - 1];
+                
+                // If the last message is not from AI, create a new AI message
+                if (!lastMsg || lastMsg.sender !== 'ai') {
+                  const newAiId = Math.random().toString(36).substring(2, 9);
+                  const newMsg: Message = {
+                    id: newAiId,
+                    text: assistantMessageEvent.type === 'text_delta' ? assistantMessageEvent.delta : '',
+                    thinking: assistantMessageEvent.type === 'thinking_delta' ? assistantMessageEvent.delta : '',
+                    sender: 'ai'
+                  };
+                  newMessages.push(newMsg);
+                } else {
+                  // Safely modify the cloned last message without side effects
+                  if (assistantMessageEvent.type === 'text_delta') {
+                    lastMsg.text = (lastMsg.text || '') + assistantMessageEvent.delta;
+                    lastMsg.status = ''; // Clear status once it starts returning final text
+                  } else if (assistantMessageEvent.type === 'thinking_delta') {
+                    lastMsg.thinking = (lastMsg.thinking || '') + assistantMessageEvent.delta;
+                  }
+                }
+                
+                return { ...chat, messages: newMessages };
+              }
+              return chat;
+            }));
+          }
+        } else if (data.type === 'tool_execution_start') {
+          setIsTyping(false);
+          const actionMap: Record<string, string> = {
+            read: 'Reading file',
+            write: 'Writing file',
+            bash: 'Running command',
+            edit: 'Editing file'
+          };
+          const action = actionMap[data.toolName] || 'Executing';
+          const target = data.args?.path || data.args?.command || '';
+          addLog('info', `[Pi Agent] 🛠️ ${action}: [${target}] ${data.args ? `args: ${JSON.stringify(data.args)}` : ''}`);
+
+          setSavedChats(prevChats => prevChats.map(chat => {
+            if (chat.id === activeSessionId) {
+              const newMessages = chat.messages.map((m, idx) => {
+                if (idx === chat.messages.length - 1 && m.sender === 'ai') {
+                  const shortTarget = target.length > 30 ? '...' + target.slice(-27) : target;
+                  return { ...m, status: `${action} [${shortTarget}]` };
+                }
+                return m;
+              });
+              return { ...chat, messages: newMessages };
+            }
+            return chat;
+          }));
+        } else if (data.type === 'tool_execution_end') {
+          if (data.isError) {
+            addLog('error', `[Pi Agent] ❌ Tool [${data.toolName}] failed: ${JSON.stringify(data.result)}`);
+          } else {
+            addLog('success', `[Pi Agent] ⚙️ Tool [${data.toolName}] complete. Result length: ${data.result ? JSON.stringify(data.result).length : 0} bytes.`);
+          }
+
+          setSavedChats(prevChats => prevChats.map(chat => {
+            if (chat.id === activeSessionId) {
+              const newMessages = chat.messages.map((m, idx) => {
+                if (idx === chat.messages.length - 1 && m.sender === 'ai') {
+                  const updatedHistory = [...(m.history || [])];
+                  updatedHistory.push({
+                    type: 'tool',
+                    toolName: data.toolName,
+                    toolArgs: data.args ? JSON.stringify(data.args) : '',
+                    isError: data.isError,
+                    result: data.isError ? JSON.stringify(data.result) : undefined
+                  });
+                  return { ...m, status: '', history: updatedHistory }; // Clear status on tool completion
+                }
+                return m;
+              });
+              return { ...chat, messages: newMessages };
+            }
+            return chat;
+          }));
+        } else if (data.type === 'message_end') {
+          setIsTyping(false);
+          // Print final assistant output in terminal log
+          setSavedChats(prevChats => {
+            const chat = prevChats.find(c => c.id === activeSessionId);
+            const lastMsg = chat?.messages[chat.messages.length - 1];
+            const responseText = lastMsg?.sender === 'ai' ? lastMsg.text.trim() : '';
+            if (responseText && lastResponseLogRef.current !== responseText) {
+              lastResponseLogRef.current = responseText;
+              addLog('output', `[Response] 🤖 ${lastMsg.text}`);
+            }
+            return prevChats;
+          });
+        } else if (data.type === 'agent_end') {
+          setIsTyping(false);
+          activeAgentSessionIdRef.current = null;
+          addLog('success', `[Pi Agent] ✅ Turn finished successfully.`);
+        }
+      });
+      return () => removeListener();
+    }
+  }, []);
+
+  // ─── Session JSONL data handler (PTY mode) ─────────────────────
+  useEffect(() => {
+    const api = (window as any).api;
+    if (!api) return;
+
+    const cleanups: (() => void)[] = [];
+
+    // Handle full session messages (initial load or session change)
+    let lastLoadedWorkspace: string | null = null;
+    if (api.onSessionMessages) {
+      const unsub = api.onSessionMessages(({ sessionId, messages: sessionMsgs }: { sessionId: string; messages: any[] }) => {
+        console.log('[Session] Loaded messages:', sessionMsgs.length);
+
+        // Convert session messages to our Message format
+        const convertedMessages: Message[] = [];
+        for (const msg of sessionMsgs) {
+          if (msg.role === 'user') {
+            convertedMessages.push({
+              id: `session-user-${msg.timestamp}`,
+              text: msg.text,
+              sender: 'user'
+            });
+          } else if (msg.role === 'assistant') {
+            convertedMessages.push({
+              id: `session-ai-${msg.timestamp}`,
+              text: msg.text,
+              thinking: msg.thinking || '',
+              sender: 'ai',
+              history: msg.toolCalls?.map((tc: any) => ({
+                type: 'tool',
+                toolName: tc.name,
+                toolArgs: JSON.stringify(tc.arguments),
+                isError: false
+              })) || []
+            });
+          } else if (msg.role === 'toolResult') {
+            // Find the last assistant message and update its tool history
+            const lastAi = convertedMessages.filter(m => m.sender === 'ai').pop();
+            if (lastAi && lastAi.history) {
+              const toolEntry = lastAi.history.find(
+                (h: any) => h.type === 'tool' && h.toolName === msg.toolName
+              );
+              if (toolEntry) {
+                toolEntry.result = msg.isError ? `[Error] ${msg.text}` : msg.text;
+                toolEntry.isError = msg.isError;
+              }
+            }
+          }
+        }
+
+        if (convertedMessages.length === 0) return;
+
+        let sessionId_num = currentSessionIdRef.current;
+        if (!sessionId_num) {
+          sessionId_num = Date.now();
+          setCurrentSessionId(sessionId_num);
+          currentSessionIdRef.current = sessionId_num;
+        }
+
+        const currentWorkspacePath = currentWorkspaceRef.current?.path || null;
+        const isWorkspaceChange = lastLoadedWorkspace !== null && lastLoadedWorkspace !== currentWorkspacePath;
+        lastLoadedWorkspace = currentWorkspacePath;
+
+        setSavedChats(prevChats => {
+          const existing = prevChats.find(c => c.id === sessionId_num);
+          const workspace = currentWorkspaceRef.current;
+
+          if (existing) {
+            if (isWorkspaceChange) {
+              // Workspace changed: full replace
+              return prevChats.map(c =>
+                c.id === sessionId_num ? { ...c, messages: convertedMessages } : c
+              );
+            }
+            // Same workspace, first load: merge session + preserve any local messages
+            const sessionTexts = new Set(
+              convertedMessages.filter(m => m.sender === 'user').map(m => m.text)
+            );
+            const localOnly = existing.messages.filter(
+              m => m.sender === 'user' && !sessionTexts.has(m.text)
+            );
+            if (localOnly.length > 0) {
+              // Preserve local user messages that aren't in the session yet
+              // Insert them after the last session user message
+              const merged = [...convertedMessages, ...localOnly];
+              return prevChats.map(c =>
+                c.id === sessionId_num ? { ...c, messages: merged } : c
+              );
+            }
+            // No local-only messages, safe to replace
+            return prevChats.map(c =>
+              c.id === sessionId_num ? { ...c, messages: convertedMessages } : c
+            );
+          } else {
+            const preview = convertedMessages[0]?.text?.slice(0, 10) || 'Session';
+            return [{
+              id: sessionId_num!,
+              preview: preview.length > 10 ? preview.substring(0, 10) + '...' : preview,
+              messages: convertedMessages,
+              workspacePath: workspace?.path ?? null,
+              workspaceName: workspace?.name ?? null
+            }, ...prevChats];
+          }
+        });
+
+        setIsTyping(false);
+      });
+      cleanups.push(unsub);
+    }
+
+    // Handle individual session entries (real-time updates)
+    if (api.onSessionEntry) {
+      const unsub = api.onSessionEntry((entry: any) => {
+        if (entry.type !== 'message') return;
+        const { role, content } = entry.message;
+        // Dedup: skip already processed entries by ID
+        if (processedEntryIdsRef.current.has(entry.id)) return;
+        processedEntryIdsRef.current.add(entry.id);
+        if (processedEntryIdsRef.current.size > 10000) {
+          processedEntryIdsRef.current = new Set([...processedEntryIdsRef.current].slice(-5000));
+        }
+
+
+        // Use session ID from the watcher, or existing one
+        let activeSessionId = activeAgentSessionIdRef.current ?? currentSessionIdRef.current;
+        if (!activeSessionId) {
+          // No chat session yet — create one from the CLI session
+          activeSessionId = Date.now();
+          setCurrentSessionId(activeSessionId);
+          currentSessionIdRef.current = activeSessionId;
+          const workspace = currentWorkspaceRef.current;
+          setSavedChats(prev => [{
+            id: activeSessionId!,
+            preview: 'CLI Session',
+            messages: [],
+            workspacePath: workspace?.path ?? null,
+            workspaceName: workspace?.name ?? null
+          }, ...prev]);
+        }
+
+        if (role === 'user') {
+          const text = Array.isArray(content)
+            ? content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
+            : (typeof content === 'string' ? content : '');
+
+          setSavedChats(prevChats => {
+            const chat = prevChats.find(c => c.id === activeSessionId);
+            if (!chat) return prevChats;
+            // Deduplicate: check if recent messages already contain this text
+            const recentUserMsgs = chat.messages.filter(m => m.sender === 'user').slice(-3);
+            const isDuplicate = recentUserMsgs.some(m => m.text === text);
+            if (isDuplicate) return prevChats;
+            // Add the user message from terminal/CLI
+            return prevChats.map(c => {
+              if (c.id === activeSessionId) {
+                return { ...c, messages: [...c.messages, { id: `session-user-${entry.id}`, text, sender: 'user' as const }] };
+              }
+              return c;
+            });
+          });
+        } else if (role === 'assistant') {
+          const blocks = Array.isArray(content) ? content : [];
+          let thinking = '';
+          let text = '';
+          const toolCalls: any[] = [];
+
+          for (const block of blocks) {
+            if (block.type === 'thinking') {
+              thinking += block.thinking || '';
+            } else if (block.type === 'text') {
+              text += block.text || '';
+            } else if (block.type === 'toolCall') {
+              toolCalls.push({
+                id: block.id,
+                name: block.name,
+                arguments: block.arguments
+              });
+            }
+          }
+
+          setIsTyping(false);
+          setSavedChats(prevChats => prevChats.map(chat => {
+            if (chat.id === activeSessionId) {
+              const newMsg: Message = {
+                id: `session-ai-${entry.id}`,
+                text,
+                thinking,
+                sender: 'ai',
+                history: toolCalls.map(tc => ({
+                  type: 'tool',
+                  toolName: tc.name,
+                  toolArgs: JSON.stringify(tc.arguments),
+                  isError: false
+                }))
+              };
+              return { ...chat, messages: [...chat.messages, newMsg] };
+            }
+            return chat;
+          }));
+        } else if (role === 'toolResult') {
+          const resultText = Array.isArray(entry.message.content)
+            ? entry.message.content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
+            : '';
+
+          setSavedChats(prevChats => prevChats.map(chat => {
+            if (chat.id === activeSessionId) {
+              const newMessages = chat.messages.map((m, idx) => {
+                if (idx === chat.messages.length - 1 && m.sender === 'ai' && m.history) {
+                  const updatedHistory = m.history.map((h: any) => {
+                    if (h.type === 'tool' && h.toolName === entry.message.toolName && !h.result) {
+                      return { ...h, result: entry.message.isError ? `[Error] ${resultText}` : resultText, isError: entry.message.isError };
+                    }
+                    return h;
+                  });
+                  return { ...m, history: updatedHistory };
+                }
+                return m;
+              });
+              return { ...chat, messages: newMessages };
+            }
+            return chat;
+          }));
+        }
+      });
+      cleanups.push(unsub);
+    }
+
+    return () => cleanups.forEach(fn => fn());
+  }, []);
+
+  // Auto scroll terminal to bottom
+  useEffect(() => {
+    if (showTerminalMode && terminalEndRef.current) {
+      terminalEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [terminalLogs, showTerminalMode]);
+
+  const handleTerminalInputSubmit = () => {
+    const text = terminalInputText.trim();
+    if (!text) return;
+
+    lastResponseLogRef.current = null;
+    setTerminalInputText('');
+    appendTerminalLog('input', text);
+
+    const api = (window as any).api;
+    if (api?.sendPiCommand) {
+      api.sendPiCommand({
+        id: Date.now().toString(),
+        type: 'prompt',
+        message: text,
+      });
+    } else {
+      appendTerminalLog('error', 'Pi Agent API is not available. Please run inside Electron.');
+    }
+  };
+
+  const handlePaste = (e: React.ClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    if (items) {
+      for (let i = 0; i < items.length; i++) {
+        if (items[i].kind === 'file') {
+          const file = items[i].getAsFile();
+          if (file) {
+            e.preventDefault();
+            setSelectedFile(file);
+            break;
+          }
+        }
+      }
+    }
+  };
+
+  const handleSend = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const text = inputText.trim();
+    if (!text && !selectedFile) return;
+
+    const currentAttachment = selectedFile ? { name: selectedFile.name, type: selectedFile.type } : undefined;
+    const fileToUpload = selectedFile;
+
+    setInputText('');
+    setSelectedFile(null);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+
+    let sessionId = currentSessionId;
+    let isNewSession = false;
+
+    if (!sessionId) {
+      sessionId = Date.now();
+      isNewSession = true;
+      setCurrentSessionId(sessionId);
+      currentSessionIdRef.current = sessionId;
+    }
+
+    const newMessageId = Math.random().toString(36).substring(2, 9);
+    const newMessage: Message = { id: newMessageId, text, sender: 'user', attachment: currentAttachment };
+
+    setSavedChats(prevChats => {
+      if (isNewSession) {
+        const workspace = currentWorkspaceRef.current;
+        const previewText = text || (currentAttachment ? `[文件] ${currentAttachment.name}` : '');
+        const preview = previewText.length > 10 ? previewText.substring(0, 10) + '...' : previewText;
+        return [{
+          id: sessionId as number,
+          preview,
+          messages: [newMessage],
+          workspacePath: workspace?.path ?? null,
+          workspaceName: workspace?.name ?? null
+        }, ...prevChats];
+      } else {
+        return prevChats.map(chat =>
+          chat.id === sessionId
+            ? { ...chat, messages: [...chat.messages, newMessage] }
+            : chat
+        );
+      }
+    });
+
+    setIsTyping(true);
+    activeAgentSessionIdRef.current = sessionId;
+
+    let finalPrompt = text;
+    let imagesPayload: any[] | undefined = undefined;
+
+    if (fileToUpload) {
+      try {
+        const fileData = await new Promise<{ base64: string; textContent: string | null }>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const dataUrl = reader.result as string;
+            const base64 = dataUrl.split(',')[1];
+            const isImg = fileToUpload.type.startsWith('image/');
+            if (!isImg && fileToUpload.size < 5 * 1024 * 1024) {
+              const textReader = new FileReader();
+              textReader.onload = () => resolve({ base64, textContent: textReader.result as string });
+              textReader.onerror = () => resolve({ base64, textContent: null });
+              textReader.readAsText(fileToUpload);
+            } else {
+              resolve({ base64, textContent: null });
+            }
+          };
+          reader.onerror = reject;
+          reader.readAsDataURL(fileToUpload);
+        });
+
+        const apiUpload = (window as any).api;
+        let savedAbsPath: string | null = null;
+        if (apiUpload && apiUpload.saveUploadedFile) {
+          const result = await apiUpload.saveUploadedFile(fileToUpload.name, fileData.base64);
+          if (result?.success && result?.path) {
+            savedAbsPath = result.path;
+          }
+        }
+
+        const isImage = fileToUpload.type.startsWith('image/');
+        const pathHint = savedAbsPath
+          ? `已保存至: ${savedAbsPath}`
+          : `已保存至 .uploaded_files/${fileToUpload.name}`;
+        if (isImage) {
+          imagesPayload = [{
+            type: "image",
+            data: fileData.base64,
+            mimeType: fileToUpload.type
+          }];
+          finalPrompt = `[用户附带了图片，${pathHint}]\n${text}`;
+        } else {
+          if (fileData.textContent !== null) {
+            const fileExtension = fileToUpload.name.split('.').pop() || '';
+            finalPrompt = `[用户附带了文本文件: ${fileToUpload.name}，${pathHint}]\n文件内容如下:\n\`\`\`${fileExtension}\n${fileData.textContent}\n\`\`\`\n\n${text}`;
+          } else {
+            finalPrompt = `[用户附带了文件: ${fileToUpload.name}，${pathHint}]\n${text}`;
+          }
+        }
+      } catch (err) {
+        console.error("Failed to read and upload the attached file:", err);
+      }
+    }
+
+    const api = (window as any).api;
+    if (api && api.sendPrompt) {
+      // Send via PTY (real Pi CLI interactive session)
+      api.sendPrompt(finalPrompt);
+    } else if (api && api.sendPiCommand) {
+      // Fallback to RPC mode
+      api.sendPiCommand({
+        id: Date.now().toString(),
+        type: 'prompt',
+        message: finalPrompt,
+        ...(imagesPayload ? { images: imagesPayload } : {})
+      });
+    } else {
+      console.warn("Electron API not available");
+      setIsTyping(false);
+    }
+  };
+
+  const scrollThumbHeight = Math.max(8, scrollState.viewportRatio * 100);
+  const scrollThumbTop = scrollState.max > 0
+    ? (scrollState.top / scrollState.max) * (100 - scrollThumbHeight)
+    : 0;
+
+  return (
+    <div className="flex h-screen w-full font-sans overflow-hidden bg-white relative" onClick={closeContextMenu}>
+
+      {/* Sidebar Backdrop (Mobile) */}
+      <div 
+        className={`fixed inset-0 bg-black/5 backdrop-blur-sm z-40 md:hidden transition-opacity duration-300 ${isSidebarOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}
+        onClick={() => toggleSidebar(false)}
+      ></div>
+
+      {/* Sidebar */}
+      <div className={`
+        fixed md:relative top-0 left-0 h-full w-[260px] bg-white/95 md:bg-gray-50/40 backdrop-blur-xl z-[10000] 
+        transform transition-transform duration-300 shadow-2xl md:shadow-none border-r border-transparent md:border-gray-100/50 flex flex-col
+        ${isSidebarOpen ? 'translate-x-0 md:ml-0' : '-translate-x-full md:-ml-[260px]'}
+      `}>
+        <div className="px-6 pt-3.5 pb-2 flex flex-col gap-2">
+            <div className="flex justify-between items-center mb-2">
+                <span className="text-[14px] font-medium text-gray-800 tracking-wide select-none">Blank AI</span>
+                <button onClick={() => toggleSidebar(false)} className="text-gray-400 hover:text-gray-800 transition-colors p-1 -mr-1" title="收起侧边栏" style={{ WebkitAppRegion: 'no-drag' } as any}>
+                    <PanelLeft size={20} strokeWidth={1.5} />
+                </button>
+            </div>
+
+            <button onClick={startNewChat} className="flex items-center gap-3 px-3 py-2.5 -mx-3 rounded-lg text-[14px] text-gray-600 hover:text-gray-900 hover:bg-gray-100/80 transition-all group cursor-pointer border border-transparent">
+                <Plus size={16} strokeWidth={1.5} className="text-gray-400 group-hover:text-gray-800 w-5" />
+                <span>新建对话</span>
+            </button>
+
+            <div className="flex items-center gap-3 px-3 py-2 -mx-3 rounded-lg bg-gray-50/50 md:bg-white/50 border border-transparent focus-within:border-gray-200 focus-within:bg-white transition-all group">
+                <Search size={16} strokeWidth={1.5} className="text-gray-400 w-5" />
+                <input 
+                    type="text" 
+                    placeholder="搜索历史" 
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    className="w-full bg-transparent text-[14px] text-gray-800 placeholder:text-gray-400 outline-none"
+                />
+            </div>
+        </div>
+
+        <div className="px-6 pt-4 pb-2 select-none flex items-center justify-between">
+            <span className="text-[11px] font-semibold text-gray-400/80 tracking-wider">Workspaces</span>
+            <button 
+                onClick={selectWorkspaceFolder}
+                className="text-gray-400 hover:text-gray-700 transition-colors p-0.5 cursor-pointer flex items-center justify-center rounded hover:bg-gray-100/60"
+                title="打开文件夹/工作区"
+            >
+                <FolderPlus size={14} strokeWidth={1.5} />
+            </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-6 py-2 flex flex-col gap-4">
+            {chatGroups.length === 0 ? (
+                <span className="text-[12px] text-gray-300">
+                  {searchQuery ? '无匹配记录' : '暂无记录'}
+                </span>
+            ) : (
+                chatGroups.map((group) => {
+                    const isCollapsed = !!collapsedGroups[group.key];
+                    return (
+                        <div key={group.key} className="flex flex-col gap-1.5">
+                            <div 
+                                onClick={() => toggleGroupCollapse(group.key)}
+                                className="flex items-center justify-between text-[13px] font-medium text-gray-500 hover:text-gray-900 select-none cursor-pointer py-1 px-1 -mx-1 rounded-md hover:bg-gray-100/40 transition-colors group"
+                            >
+                                <div className="flex items-center gap-1.5 truncate flex-1 pr-2">
+                                    {isCollapsed ? (
+                                        <ChevronRight size={13} className="text-gray-400 shrink-0" strokeWidth={2} />
+                                    ) : (
+                                        <ChevronDown size={13} className="text-gray-400 shrink-0" strokeWidth={2} />
+                                    )}
+                                    <span className="truncate">{group.name}</span>
+                                </div>
+                                {group.key !== '__empty__' && (
+                                    <div className="flex items-center gap-1 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
+                                        <button
+                                            onClick={(e) => handleRevealGroupFolder(e, group.path)}
+                                            className="text-gray-400 hover:text-gray-700 p-0.5 rounded hover:bg-gray-200/50 flex items-center justify-center cursor-pointer"
+                                            title="Reveal in File Explorer"
+                                        >
+                                            <MoreVertical size={13} strokeWidth={2} />
+                                        </button>
+                                        <button
+                                            onClick={(e) => handleNewChatInWorkspace(e, group.path, group.name)}
+                                            className="text-gray-400 hover:text-gray-800 p-0.5 rounded border border-gray-300/50 bg-gray-100/40 hover:bg-gray-200/60 flex items-center justify-center cursor-pointer shadow-sm w-4 h-4"
+                                            title="New Conversation in Workspace"
+                                        >
+                                            <Plus size={10} strokeWidth={2.5} />
+                                        </button>
+                                    </div>
+                                )}
+                            </div>
+                            {!isCollapsed && (
+                                <div className="pl-[18px] flex flex-col gap-1">
+                                    {group.chats.length === 0 ? (
+                                        <span className="text-[12px] text-gray-400/70 italic pl-2 py-1 select-none">
+                                            No chats yet
+                                        </span>
+                                    ) : (
+                                        group.chats.map((chat) => (
+                                            <div
+                                                key={chat.id}
+                                                onClick={() => loadChat(chat.id)}
+                                                className={`flex items-center justify-between group rounded-lg px-2 py-1.5 transition-all cursor-pointer ${
+                                                  currentSessionId === chat.id 
+                                                    ? 'bg-gray-100/70 text-gray-900 font-medium' 
+                                                    : 'hover:bg-gray-50 text-gray-500 hover:text-gray-900'
+                                                }`}
+                                            >
+                                                <span
+                                                    className={`text-[13px] font-medium truncate flex-1 pr-2 transition-colors ${
+                                                      currentSessionId === chat.id ? 'text-gray-900' : 'text-gray-500'
+                                                    }`}
+                                                >
+                                                    {chat.preview}
+                                                </span>
+                                                <div className="flex items-center gap-1.5 shrink-0 select-none">
+                                                    <span className="text-[10px] text-gray-400 font-normal flex items-center gap-0.5 opacity-80 group-hover:opacity-100 transition-opacity whitespace-nowrap">
+                                                        <span className="text-[9px] text-gray-300 font-sans">↱</span> {getRelativeTime(chat.id)}
+                                                    </span>
+                                                    <button
+                                                        onClick={(e) => deleteChat(e, chat.id)}
+                                                        className="text-gray-300 hover:text-red-400 p-0.5 rounded opacity-100 md:opacity-0 group-hover:opacity-100 transition-all cursor-pointer flex items-center justify-center hover:bg-gray-100"
+                                                        title="删除对话"
+                                                    >
+                                                        <X size={11} strokeWidth={2} />
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        ))
+                                    )}
+                                </div>
+                            )}
+                        </div>
+                    );
+                })
+            )}
+        </div>
+
+        {/* Settings Button */}
+        <div className="px-6 pb-3 pt-1">
+          <button 
+            onClick={() => setIsSettingsOpen(true)}
+            className="flex items-center gap-3 px-3 py-2 -mx-3 rounded-xl text-[14px] font-medium text-gray-500 hover:text-gray-900 hover:bg-gray-100/60 transition-all group cursor-pointer w-full"
+          >
+            <Settings size={16} strokeWidth={1.5} className="text-gray-400 group-hover:text-gray-800" />
+            <span>设置</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Main Chat Area */}
+      <div className="flex flex-col flex-1 h-full min-w-0 relative">
+        {/* Top Navbar */}
+        <div className="absolute top-0 left-0 w-full flex items-start justify-between px-4 md:px-6 pt-safe pb-8 pt-4 md:pt-5 bg-gradient-to-b from-white via-white/90 to-transparent z-[10000] pointer-events-none">
+            <div className="flex items-start gap-4 pointer-events-auto min-w-0 pr-[160px]">
+              <div className="flex items-center gap-3 shrink-0">
+                {!isSidebarOpen && (
+                  <button onClick={() => toggleSidebar(true)} className="text-gray-400 hover:text-gray-800 transition-colors" title="展开侧边栏" style={{ WebkitAppRegion: 'no-drag' } as any}>
+                      <PanelLeft size={20} strokeWidth={1.5} />
+                  </button>
+                )}
+                <button onClick={startNewChat} className="text-gray-400 hover:text-gray-800 transition-colors p-1 flex items-center justify-center" title="新建对话" style={{ WebkitAppRegion: 'no-drag' } as any}>
+                    <Plus size={20} strokeWidth={1.5} />
+                </button>
+                <button
+                    onClick={selectWorkspaceFolder}
+                    className={`text-gray-400 hover:text-gray-800 transition-colors p-1 flex items-center justify-center ${!isSidebarOpen ? '' : 'md:hidden'}`}
+                    title="打开新文件夹"
+                    style={{ WebkitAppRegion: 'no-drag' } as any}
+                >
+                    <FolderOpen size={20} strokeWidth={1.5} />
+                </button>
+              </div>
+              <div className="flex flex-col items-start min-w-0 max-w-[520px] select-none" style={{ WebkitAppRegion: 'no-drag' } as any}>
+                <div className="text-[15px] font-semibold text-gray-900 truncate w-full text-left leading-tight">
+                  {showTerminalMode ? "Pi CLI Terminal" : conversationTitle}
+                </div>
+                <div className="text-[11px] text-gray-400 truncate w-full text-left mt-1">
+                  {showTerminalMode ? "Real PTY • Interactive Session" : workspaceLabel}
+                </div>
+              </div>
+            </div>
+             
+            <div className="flex items-center gap-3 pointer-events-auto pr-[140px]" style={{ WebkitAppRegion: 'no-drag' } as any}>
+              <button 
+                onClick={() => setShowTerminalMode(!showTerminalMode)}
+                className={`p-1.5 rounded-xl border transition-all cursor-pointer flex items-center justify-center ${
+                  showTerminalMode 
+                    ? 'bg-gray-900 text-emerald-400 border-gray-800 shadow-[0_0_8px_rgba(52,211,153,0.3)]' 
+                    : 'bg-white hover:bg-gray-50 text-gray-400 hover:text-gray-800 border-gray-200'
+                }`}
+                title={showTerminalMode ? "返回聊天界面" : "切换到 Pi CLI 终端"}
+              >
+                <Terminal size={18} strokeWidth={showTerminalMode ? 2 : 1.5} />
+              </button>
+            </div>
+        </div>
+
+        {/* Message Outline (Desktop Right Side) */}
+        {!showTerminalMode && messages.length > 0 && (
+          <div className="hidden lg:flex flex-col absolute right-4 top-[20%] bottom-[25%] w-16 z-30 pointer-events-none items-end justify-center py-4">
+            <div className="flex flex-col gap-2 pointer-events-auto pr-2 overflow-y-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none] scroll-smooth">
+              {messages.map((msg, index) => {
+                if (msg.sender !== 'user') return null;
+                
+                const textContent = msg.text || (msg.attachment ? `[文件] ${msg.attachment.name}` : '');
+                
+                return (
+                  <div 
+                    key={msg.id || index} 
+                    className="group relative flex items-center justify-end w-full cursor-pointer py-1" 
+                    onClick={() => {
+                      const el = document.getElementById(msg.id ? `msg-${msg.id}` : `msg-idx-${index}`);
+                      if (el) {
+                        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                      }
+                    }}
+                  >
+                    <div className="absolute right-5 opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap bg-white/95 border border-gray-100 shadow-sm px-2.5 py-1.5 rounded-lg text-[13px] text-gray-500 max-w-[200px] truncate pointer-events-none">
+                      {textContent}
+                    </div>
+                    <div className="w-2.5 h-[2px] rounded-full bg-gray-200 group-hover:bg-gray-400 group-hover:w-4 transition-all duration-300"></div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Message Scrollbar (Desktop Right Side) */}
+        {!showTerminalMode && messages.length > 0 && scrollState.max > 0 && (
+          <div
+            ref={scrollTrackRef}
+            onMouseDown={handleMessageScrollTrackClick}
+            className="hidden lg:block absolute right-1 top-24 bottom-32 w-4 z-40 pointer-events-auto cursor-pointer"
+            title="拖动滚动历史消息"
+          >
+            <div
+              onMouseDown={beginMessageScrollDrag}
+              className="absolute right-0 w-[6px] rounded-full bg-gray-300/70 hover:bg-gray-400/80 active:bg-gray-500/80 transition-colors shadow-sm cursor-grab active:cursor-grabbing"
+              style={{
+                top: `${scrollThumbTop}%`,
+                height: `${scrollThumbHeight}%`,
+                minHeight: '36px',
+                WebkitAppRegion: 'no-drag'
+              } as any}
+            />
+          </div>
+        )}
+
+        /* Real PTY Terminal - always rendered, toggled via CSS */
+        <div className={`${showTerminalMode ? "flex" : "hidden"} flex-1 flex-col bg-[#0b0c0d] h-full relative overflow-hidden pt-12`}>
+          <XtermTerminal visible={showTerminalMode} />
+        </div>
+
+        /* Normal Chat Interface */
+        <div className={`${showTerminalMode ? "hidden" : "flex"} flex-1 flex-col w-full`}>
+            {/* Chat Content */}
+        <div ref={chatAreaRef} onScroll={updateScrollState} className="flex-1 overflow-y-auto px-6 pt-24 pb-32 flex flex-col items-center w-full z-0">
+          <div className="w-full max-w-[752px] flex flex-col gap-6">
+            <Suspense fallback={null}>
+            {messages.map((msg, index) => (
+                <ChatMessage
+                    key={msg.id || index}
+                    message={msg}
+                    index={index}
+                    currentSessionId={currentSessionId}
+                    showThinking={showThinking}
+                    onToggleHistory={toggleMessageHistory}
+                />
+            ))}
+            </Suspense>
+            
+            {isTyping && (
+                <div className="self-start text-black text-[15px] msg-enter flex items-center h-6">
+                    <span className="typing-dot"></span>
+                    <span className="typing-dot"></span>
+                    <span className="typing-dot"></span>
+                </div>
+            )}
+           </div>
+        </div>
+
+        {/* Input Area */}
+        <div className="absolute bottom-0 left-0 w-full flex justify-center bg-gradient-to-t from-white via-white/95 to-transparent pb-6 pt-12 z-20 pointer-events-none">
+          <form onSubmit={handleSend} className="w-full max-w-[752px] px-6 pb-2 flex flex-col gap-3 relative pointer-events-auto">
+              {/* Selected File Indicator */}
+              {selectedFile && (
+                  <div className="self-start flex items-center bg-white border border-gray-200 rounded-full pl-3 pr-1.5 py-1.5 gap-2 shadow-sm text-sm">
+                      <span className="text-[13px] text-gray-600 truncate max-w-[200px] font-medium">{selectedFile.name}</span>
+                      <button 
+                          type="button" 
+                          onClick={(e) => {
+                              e.preventDefault();
+                              setSelectedFile(null);
+                              if (fileInputRef.current) fileInputRef.current.value = '';
+                          }} 
+                          className="p-1 rounded-full text-gray-400 hover:text-gray-800 hover:bg-gray-100 transition-colors"
+                          title="移除文件"
+                      >
+                          <X size={14} strokeWidth={2} />
+                      </button>
+                  </div>
+              )}
+              <div className="w-full relative flex items-center bg-white border border-gray-200 rounded-3xl shadow-[0_2px_12px_rgba(0,0,0,0.04)] focus-within:border-gray-300 focus-within:shadow-[0_4px_20px_rgba(0,0,0,0.08)] transition-all duration-300">
+                  <input 
+                      type="file" 
+                      ref={fileInputRef} 
+                      className="hidden" 
+                      onChange={(e) => {
+                          if (e.target.files && e.target.files[0]) {
+                              setSelectedFile(e.target.files[0]);
+                          }
+                      }}
+                  />
+                                    <button 
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      className="absolute left-2 p-2 text-gray-400 hover:text-gray-800 transition-colors flex items-center justify-center rounded-full hover:bg-gray-100/80"
+                      title="上传文件"
+                  >
+                      <Plus size={20} strokeWidth={2} />
+                  </button>
+                  <input 
+                      ref={inputRef}
+                      type="text" 
+                      value={inputText}
+                      onChange={(e) => setInputText(e.target.value)}
+                      onPaste={handlePaste}
+                      onContextMenu={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setContextMenu({ x: e.clientX, y: e.clientY });
+                          inputRef.current?.focus();
+                      }}
+                      onKeyDown={(e) => {
+                          const sendShortcut = (() => {
+                              try {
+                                  const saved = localStorage.getItem('blankAI_sendShortcut');
+                                  return saved ? JSON.parse(saved) : 'enter';
+                              } catch {
+                                  return 'enter';
+                              }
+                          })();
+                          if (e.key === 'Enter') {
+                              if (sendShortcut === 'ctrl-enter') {
+                                  if (!e.ctrlKey && !e.metaKey) {
+                                      e.preventDefault(); // Stop standard enter submission
+                                  }
+                              } else {
+                                  if (e.ctrlKey || e.metaKey || e.shiftKey) {
+                                      // Allow modifier operations
+                                  }
+                              }
+                          }
+                      }}
+                      autoComplete="off" 
+                      placeholder="Ask anything" 
+                      className="w-full bg-transparent py-3.5 pl-12 pr-48 text-gray-800 text-[15px] placeholder:text-gray-400 placeholder:font-light outline-none rounded-3xl"
+                  />
+                  <button type="submit" className="hidden" />
+
+                  {contextMenu && (
+                      <div
+                          className="fixed z-[100000] w-40 rounded-xl border border-gray-200 bg-white/95 shadow-[0_12px_32px_rgba(0,0,0,0.12)] p-1.5 text-[13px] text-gray-700 backdrop-blur-md animate-popover-in"
+                          style={{ left: contextMenu.x, top: contextMenu.y, WebkitAppRegion: 'no-drag' } as any}
+                          onClick={(e) => e.stopPropagation()}
+                      >
+                          <button type="button" onClick={() => runInputMenuAction('cut')} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-gray-100 transition-colors text-left">
+                              <Scissors size={14} className="text-gray-400" />
+                              <span>剪切</span>
+                          </button>
+                          <button type="button" onClick={() => runInputMenuAction('copy')} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-gray-100 transition-colors text-left">
+                              <Copy size={14} className="text-gray-400" />
+                              <span>复制</span>
+                          </button>
+                          <button type="button" onClick={() => runInputMenuAction('paste')} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-gray-100 transition-colors text-left">
+                              <Clipboard size={14} className="text-gray-400" />
+                              <span>粘贴</span>
+                          </button>
+                          <div className="my-1 h-px bg-gray-100" />
+                          <button type="button" onClick={() => runInputMenuAction('selectAll')} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-gray-100 transition-colors text-left">
+                              <MousePointer2 size={14} className="text-gray-400" />
+                              <span>全选</span>
+                          </button>
+                          <button type="button" onClick={() => runInputMenuAction('clear')} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-red-50 hover:text-red-500 transition-colors text-left">
+                              <X size={14} className="text-gray-400" />
+                              <span>清空</span>
+                          </button>
+                      </div>
+                  )}
+
+                  {/* Model & Thinking Selector Dropdown */}
+                  <div className="absolute right-2 flex items-center z-30 model-selector-container">
+                      <button 
+                          type="button"
+                          onClick={(e) => {
+                              e.preventDefault();
+                              setIsModelDropdownOpen(!isModelDropdownOpen);
+                              setPopoverView('main'); // Reset to main pane on open
+                          }}
+                          className="flex items-center gap-1.5 px-3 py-1.5 rounded-full hover:bg-gray-100 transition-all duration-200 text-gray-700 hover:text-black border border-gray-100/50 hover:border-gray-200 bg-white/80 shadow-sm"
+                      >
+                          <span className="text-[12px] font-medium truncate max-w-[90px] tracking-tight">
+                              {currentModel ? currentModel.name : 'Select Model'}
+                          </span>
+                          <span className="h-3 w-[1px] bg-gray-200"></span>
+                          <span className="text-[10px] font-semibold text-cyan-600 bg-cyan-50 px-1.5 py-0.5 rounded-md tracking-tight select-none">
+                              {getThinkingLabel(thinkingLevel)}
+                          </span>
+                          <ChevronDown size={13} className={`text-gray-400 transition-transform duration-300 ${isModelDropdownOpen ? 'rotate-180 text-black' : ''}`} strokeWidth={2.5} />
+                      </button>
+
+                      {/* Dropdown Popover */}
+                      {isModelDropdownOpen && (
+                          <div className="absolute bottom-[calc(100%+12px)] right-0 w-[260px] bg-white border border-gray-200 rounded-2xl shadow-[0_10px_35px_rgba(0,0,0,0.08)] py-2 z-50 animate-popover-in flex flex-col gap-0.5 pointer-events-auto">
+                              {popoverView === 'main' ? (
+                                  <>
+                                      {/* Pane 1: Thinking Intensity Selection */}
+                                      <div className="px-3 py-1 border-b border-gray-100 flex items-center justify-between mb-1">
+                                          <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">智能 / 思考强度</span>
+                                          <span className="text-[9px] text-cyan-600 bg-cyan-50 px-1.5 py-0.5 rounded-md font-mono select-none">PI NATIVE</span>
+                                      </div>
+                                      <div className="max-h-[220px] overflow-y-auto px-1.5 py-0.5 custom-scrollbar flex flex-col gap-0.5">
+                                          {['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].map((level) => {
+                                              const isSelected = thinkingLevel === level;
+                                              return (
+                                                  <button
+                                                      key={level}
+                                                      type="button"
+                                                      onClick={() => {
+                                                          setThinkingLevel(level);
+                                                          setThinkingLevel(level);
+                                                          // Notify CLI to cycle thinking level
+                                                          const api = (window as any).api;
+                                                          if (api?.sendKeybinding) api.sendKeybinding('thinking-cycle');
+                                                          // Thinking level is synced from PTY session file
+                                                      }}
+                                                      className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-left transition-all duration-150 ${
+                                                          isSelected 
+                                                              ? 'bg-cyan-50 border border-cyan-100/50 text-cyan-800 font-medium' 
+                                                              : 'text-gray-700 hover:bg-gray-100 hover:text-black border border-transparent'
+                                                      }`}
+                                                      title={getThinkingDesc(level)}
+                                                  >
+                                                      <div className="flex flex-col min-w-0">
+                                                          <div className="flex items-center gap-1.5">
+                                                              <span className="text-[13px] font-medium">{getThinkingLabel(level)}</span>
+                                                              {level === 'high' && (
+                                                                  <span className="text-[8px] font-bold text-cyan-600 bg-cyan-100/60 px-1 rounded select-none">推荐</span>
+                                                              )}
+                                                          </div>
+                                                          <span className={`text-[9px] truncate ${isSelected ? 'text-cyan-600' : 'text-gray-400'}`}>
+                                                              {getThinkingDesc(level)}
+                                                          </span>
+                                                      </div>
+                                                      {isSelected && (
+                                                          <span className="w-1.5 h-1.5 rounded-full bg-cyan-600 ml-2 flex-shrink-0 animate-pulse"></span>
+                                                      )}
+                                                  </button>
+                                              );
+                                          })}
+                                      </div>
+                                      
+                                      {/* Separator and Model Trigger */}
+                                      <div className="border-t border-gray-100/80 my-1 mx-1.5"></div>
+                                      <div className="px-1.5">
+                                          <button
+                                              type="button"
+                                              onClick={() => setPopoverView('models')}
+                                              className="w-full flex items-center justify-between px-3 py-2 rounded-xl text-left text-gray-700 hover:bg-gray-100 hover:text-black transition-all duration-150"
+                                          >
+                                              <div className="flex flex-col min-w-0">
+                                                  <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">当前模型</span>
+                                                  <span className="text-[13px] font-medium truncate mt-0.5">{currentModel ? currentModel.name : '选择语言模型'}</span>
+                                              </div>
+                                              <ChevronRight size={14} className="text-gray-400" />
+                                          </button>
+                                      </div>
+                                  </>
+                              ) : (
+                                  <>
+                                      {/* Pane 2: Model Picker */}
+                                      <div className="px-2 py-1 border-b border-gray-100 flex items-center gap-1.5 mb-1.5">
+                                          <button
+                                              type="button"
+                                              onClick={() => setPopoverView('main')}
+                                              className="p-1 rounded-lg hover:bg-gray-100 text-gray-500 hover:text-black transition-colors"
+                                          >
+                                              <ChevronLeft size={14} strokeWidth={2.5} />
+                                          </button>
+                                          <span className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">选择语言模型</span>
+                                      </div>
+                                      <div className="px-1.5 py-2 flex flex-col gap-2">
+                                          {currentModel && (
+                                              <div className="px-3 py-2 rounded-xl bg-gray-50 border border-gray-100">
+                                                  <div className="text-[13px] font-medium text-gray-800">{currentModel.name}</div>
+                                                  <div className="text-[10px] text-gray-400 uppercase tracking-wider">{currentModel.provider}</div>
+                                              </div>
+                                          )}
+                                          <button
+                                              type="button"
+                                              onClick={() => {
+                                                  const api = (window as any).api;
+                                                  if (api?.sendKeybinding) {
+                                                      api.sendKeybinding('model-cycle');
+                                                  }
+                                                  setIsModelDropdownOpen(false);
+                                              }}
+                                              className="w-full flex items-center justify-center gap-2 px-3 py-2.5 rounded-xl text-[13px] font-medium text-gray-700 bg-white hover:bg-gray-100 border border-gray-200 hover:border-gray-300 transition-all"
+                                          >
+                                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                                  <path d="M17 1l4 4-4 4" /><path d="M3 11V9a4 4 0 0 1 4-4h14" />
+                                                  <path d="M7 23l-4-4 4-4" /><path d="M21 13v2a4 4 0 0 1-4 4H3" />
+                                              </svg>
+                                              切换模型 (Ctrl+P)
+                                          </button>
+                                          {models.length > 1 && (
+                                              <>
+                                                  <div className="h-px bg-gray-100 my-1"></div>
+                                                  <div className="text-[10px] text-gray-400 px-1 mb-1">已发现的模型</div>
+                                                  {models.map((m) => {
+                                                      const isSelected = currentModel?.id === m.id && currentModel?.provider === m.provider;
+                                                      return (
+                                                          <div
+                                                              key={`${m.provider}-${m.id}`}
+                                                              className={`px-3 py-1.5 rounded-lg text-[12px] ${isSelected ? 'bg-gray-100 text-gray-800 font-medium' : 'text-gray-400'}`}
+                                                          >
+                                                              <span className="truncate">{m.name}</span>
+                                                              <span className="ml-1.5 text-[9px] uppercase tracking-wider">{m.provider}</span>
+                                                          </div>
+                                                      );
+                                                  })}
+                                              </>
+                                          )}
+                                      </div>
+                                  </>
+                              )}
+                          </div>
+                      )}
+                  </div>
+              </div>
+          </form>
+        </div>
+        </div>
+      </div>
+
+      {/* Settings Panel Modal */}
+      {isSettingsOpen && (
+        <Suspense fallback={null}>
+          <SettingsPanel isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} />
+        </Suspense>
+      )}
+    </div>
+  );
+}
+
+
+## FILE: src/types.ts
+export interface WorkspaceInfo {
+  path: string;
+  name: string;
+}
+
+export interface Message {
+  id?: string;
+  text: string;
+  sender: 'user' | 'ai';
+  thinking?: string;
+  status?: string;
+  history?: {
+    type: 'thinking' | 'tool';
+    content?: string;
+    toolName?: string;
+    toolArgs?: string;
+    isError?: boolean;
+    result?: string;
+  }[];
+  isHistoryOpen?: boolean;
+  attachment?: {
+    name: string;
+    type: string;
+  };
+}
+
+export interface ChatSession {
+  id: number;
+  preview: string;
+  messages: Message[];
+  workspacePath?: string | null;
+  workspaceName?: string | null;
+}
+
+export interface ChatGroup {
+  key: string;
+  name: string;
+  path: string | null;
+  chats: ChatSession[];
+}
+
+export interface ModelInfo {
+  id: string;
+  name: string;
+  provider: string;
+}
+
+## FILE: src/ChatMessage.tsx
+import { ChevronDown, ChevronUp, Terminal } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import type { Message } from './types';
+
+interface ChatMessageProps {
+  message: Message;
+  index: number;
+  currentSessionId: number | null;
+  showThinking: boolean;
+  onToggleHistory: (sessionId: number, messageId: string | undefined, index: number) => void;
+}
+
+export default function ChatMessage({
+  message,
+  index,
+  currentSessionId,
+  showThinking,
+  onToggleHistory,
+}: ChatMessageProps) {
+  const hasThinking = message.sender === 'ai' && (message.thinking || message.status || (message.history && message.history.length > 0));
+  const messageId = message.id ? `msg-${message.id}` : `msg-idx-${index}`;
+
+  return (
+    <div
+      id={messageId}
+      className={`leading-relaxed text-[15px] tracking-wide msg-enter flex flex-col gap-2 ${
+        message.sender === 'user'
+          ? 'max-w-[85%] self-end items-end'
+          : 'w-full self-start items-start'
+      }`}
+    >
+      {message.attachment && (
+        <div className="flex items-center gap-2 bg-gray-50 border border-gray-100 rounded-xl px-4 py-2.5 text-[13px] text-gray-600 shadow-sm">
+          <span className="truncate max-w-[200px] font-medium">{message.attachment.name}</span>
+        </div>
+      )}
+
+      {hasThinking && showThinking && (
+        <div className="text-[13px] text-gray-400 border-l border-gray-100 pl-3 mb-2 italic select-none">
+          <div className="flex items-center gap-2 mb-1">
+            <span className="font-medium not-italic text-[10px] uppercase tracking-widest text-gray-300 flex items-center gap-1.5">
+              {message.status ? (
+                <>
+                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse"></span>
+                  {message.status}
+                </>
+              ) : 'Thinking Process'}
+            </span>
+            {(message.history && message.history.length > 0 && currentSessionId) && (
+              <button
+                onClick={() => onToggleHistory(currentSessionId, message.id, index)}
+                className="text-gray-300 hover:text-gray-600 transition-colors p-0.5 cursor-pointer flex items-center justify-center rounded bg-gray-50/50 hover:bg-gray-100/80"
+                title="View Full History"
+              >
+                {message.isHistoryOpen ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+              </button>
+            )}
+          </div>
+
+          {message.thinking && <div>{message.thinking}</div>}
+
+          {message.isHistoryOpen && message.history && (
+            <div className="mt-3 flex flex-col gap-2 border-t border-gray-100/50 pt-3 not-italic">
+              {message.history.map((step, i) => (
+                <div key={i} className="bg-gray-50/50 rounded-lg p-2.5 text-[12px] border border-gray-100/50">
+                  {step.type === 'thinking' && (
+                    <div className="text-gray-500 italic leading-relaxed">{step.content}</div>
+                  )}
+                  {step.type === 'tool' && (
+                    <div className="flex flex-col gap-1.5">
+                      <div className="flex items-center gap-1.5 font-medium text-gray-600">
+                        <Terminal size={12} className="text-gray-400" />
+                        <span>{step.toolName}</span>
+                      </div>
+                      {step.toolArgs && step.toolArgs !== '{}' && (
+                        <div className="text-gray-400 font-mono text-[10px] bg-white px-2 py-1.5 rounded border border-gray-100 overflow-hidden text-ellipsis whitespace-pre-wrap break-all max-h-[100px] overflow-y-auto">
+                          {step.toolArgs}
+                        </div>
+                      )}
+                      {step.isError && (
+                        <div className="text-red-400 mt-0.5 font-mono text-[10px] bg-red-50 px-2 py-1.5 rounded border border-red-100 overflow-hidden text-ellipsis whitespace-pre-wrap break-all max-h-[100px] overflow-y-auto">
+                          Error: {step.result}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {message.text && (
+        <div className={`${
+          message.sender === 'user'
+            ? 'bg-gray-100 text-gray-800 px-4 py-2.5 rounded-[20px] rounded-tr-[4px] text-left'
+            : 'text-black w-full'
+        }`}>
+          {message.sender === 'user' ? (
+            message.text
+          ) : (
+            <MarkdownMessage text={message.text} />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MarkdownMessage({ text }: { text: string }) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        code({ inline, className, children, ...props }: any) {
+          const match = /language-(\w+)/.exec(className || '');
+          return !inline && match ? (
+            <div className="rounded-xl overflow-hidden my-4 border border-gray-200/60 shadow-sm">
+              <div className="bg-[#1e1e1e] text-gray-400 text-xs px-4 py-2 flex justify-between items-center border-b border-gray-800">
+                <span>{match[1]}</span>
+              </div>
+              <SyntaxHighlighter
+                {...props}
+                children={String(children).replace(/\n$/, '')}
+                style={vscDarkPlus}
+                language={match[1]}
+                PreTag="div"
+                customStyle={{ margin: 0, padding: '1rem', background: '#1e1e1e', fontSize: '13px', lineHeight: '1.5' }}
+              />
+            </div>
+          ) : (
+            <code {...props} className="bg-gray-100 text-gray-800 px-1.5 py-0.5 rounded text-[13px] font-mono whitespace-pre-wrap">
+              {children}
+            </code>
+          );
+        },
+        p: ({ children }) => <p className="mb-4 last:mb-0 leading-[1.7]">{children}</p>,
+        ul: ({ children }) => <ul className="list-disc pl-5 mb-4 space-y-1">{children}</ul>,
+        ol: ({ children }) => <ol className="list-decimal pl-5 mb-4 space-y-1">{children}</ol>,
+        li: ({ children }) => <li className="leading-[1.7]">{children}</li>,
+        h1: ({ children }) => <h1 className="text-2xl font-bold mt-6 mb-4">{children}</h1>,
+        h2: ({ children }) => <h2 className="text-xl font-bold mt-6 mb-3">{children}</h2>,
+        h3: ({ children }) => <h3 className="text-lg font-bold mt-5 mb-2">{children}</h3>,
+        a: ({ children, href }) => <a href={href} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:underline">{children}</a>,
+        blockquote: ({ children }) => <blockquote className="border-l-4 border-gray-200 pl-4 italic text-gray-600 my-4">{children}</blockquote>,
+        table: ({ children }) => <div className="overflow-x-auto my-4"><table className="w-full text-left border-collapse">{children}</table></div>,
+        thead: ({ children }) => <thead className="bg-gray-50/80 border-b border-gray-200">{children}</thead>,
+        tbody: ({ children }) => <tbody className="divide-y divide-gray-100">{children}</tbody>,
+        tr: ({ children }) => <tr className="hover:bg-gray-50/50 transition-colors">{children}</tr>,
+        th: ({ children }) => <th className="px-4 py-3 text-sm font-semibold text-gray-700 whitespace-nowrap">{children}</th>,
+        td: ({ children }) => <td className="px-4 py-3 text-sm text-gray-600">{children}</td>,
+      }}
+    >
+      {text}
+    </ReactMarkdown>
+  );
+}
+
+## FILE: src/XtermTerminal.tsx
+import React, { useEffect, useRef, useCallback } from 'react';
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+import '@xterm/xterm/css/xterm.css';
+
+interface XtermTerminalProps {
+  visible: boolean;
+}
+
+export default function XtermTerminal({ visible }: XtermTerminalProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const terminalRef = useRef<Terminal | null>(null);
+  const fitAddonRef = useRef<FitAddon | null>(null);
+  const cleanupRef = useRef<(() => void)[]>([]);
+
+  // Initialize terminal
+  useEffect(() => {
+    if (!containerRef.current) return;
+
+    const terminal = new Terminal({
+      cursorBlink: true,
+      fontSize: 14,
+      fontFamily: '"JetBrains Mono", "Fira Code", "Cascadia Code", Menlo, Monaco, monospace',
+      theme: {
+        background: '#0b0c0d',
+        foreground: '#e4e4e7',
+        cursor: '#10b981',
+        cursorAccent: '#0b0c0d',
+        selectionBackground: '#264f78',
+        black: '#1e1e2e',
+        red: '#f38ba8',
+        green: '#a6e3a1',
+        yellow: '#f9e2af',
+        blue: '#89b4fa',
+        magenta: '#f5c2e7',
+        cyan: '#94e2d5',
+        white: '#bac2de',
+        brightBlack: '#585b70',
+        brightRed: '#f38ba8',
+        brightGreen: '#a6e3a1',
+        brightYellow: '#f9e2af',
+        brightBlue: '#89b4fa',
+        brightMagenta: '#f5c2e7',
+        brightCyan: '#94e2d5',
+        brightWhite: '#a6adc8',
+      },
+      allowProposedApi: true,
+      scrollback: 10000,
+    });
+
+    const fitAddon = new FitAddon();
+    terminal.loadAddon(fitAddon);
+
+    terminal.open(containerRef.current);
+    terminalRef.current = terminal;
+    fitAddonRef.current = fitAddon;
+
+    // Initial fit + resize to trigger CLI re-render
+    setTimeout(() => {
+      try {
+        fitAddon.fit();
+        const api = (window as any).api;
+        if (api?.ptyResize) {
+          api.ptyResize(terminal.cols, terminal.rows);
+        }
+        terminal.focus();
+      } catch {}
+    }, 150);
+
+    // Connect PTY output -> terminal
+    const api = (window as any).api;
+    if (api?.onPtyData) {
+      const unsub = api.onPtyData((data: string) => {
+        terminal.write(data);
+      });
+      cleanupRef.current.push(unsub);
+    }
+
+    // Connect terminal input -> PTY
+    terminal.onData((data) => {
+      if (api?.ptyInput) {
+        api.ptyInput(data);
+      }
+    });
+
+    // Connect terminal resize -> PTY
+    terminal.onResize(({ cols, rows }) => {
+      if (api?.ptyResize) {
+        api.ptyResize(cols, rows);
+      }
+    });
+
+    // Handle PTY exit
+    if (api?.onPtyExit) {
+      const unsub = api.onPtyExit(({ code }: { code: number }) => {
+        terminal.writeln('');
+        terminal.writeln(`\x1b[33m[Process exited with code ${code}]\x1b[0m`);
+        terminal.writeln('\x1b[90mPress any key or send a message to restart...\x1b[0m');
+      });
+      cleanupRef.current.push(unsub);
+    }
+
+    // Handle window resize
+    const handleResize = () => {
+      try {
+        fitAddon.fit();
+      } catch {}
+    };
+    window.addEventListener('resize', handleResize);
+    cleanupRef.current.push(() => window.removeEventListener('resize', handleResize));
+
+    return () => {
+      cleanupRef.current.forEach(fn => fn());
+      cleanupRef.current = [];
+      terminal.dispose();
+      terminalRef.current = null;
+      fitAddonRef.current = null;
+    };
+  }, []);
+
+  // Fit when visibility changes
+  useEffect(() => {
+    if (visible && fitAddonRef.current && terminalRef.current) {
+      setTimeout(() => {
+        try {
+          fitAddonRef.current!.fit();
+          const api = (window as any).api;
+          if (api?.ptyResize) {
+            api.ptyResize(terminalRef.current!.cols, terminalRef.current!.rows);
+          }
+          terminalRef.current!.focus();
+        } catch {}
+      }, 50);
+    }
+  }, [visible]);
+
+  return (
+    <div
+      ref={containerRef}
+      className="w-full h-full"
+      style={{ padding: '8px 12px' }}
+    />
+  );
+}
+
+## FILE: src/SettingsPanel.tsx
+import React, { useState, useEffect } from 'react';
+import { X, Plus, Settings, Sparkles, Plug2, Trash2, Pencil, Sun, Moon, Monitor, Maximize2, Minimize2, Cpu, Puzzle, Globe, Terminal, Image, Eye, EyeOff, Check, Key } from 'lucide-react';
+import {
+  BUILTIN_PROVIDERS,
+  DEFAULT_PLUGINS,
+  DEFAULT_PROVIDERS,
+  type CustomProvider,
+  type PluginItem,
+  type ProviderSettings,
+  mergeProvidersWithEnv,
+  providersToEnv,
+} from './settingsConfig';
+
+// ── Types ──────────────────────────────────────────────
+export interface Skill {
+  id: string;
+  name: string;
+  description: string;
+  content: string;
+  enabled: boolean;
+}
+
+export interface McpServer {
+  id: string;
+  name: string;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  enabled: boolean;
+}
+
+type SettingsTab = 'general' | 'providers' | 'skills' | 'mcp' | 'plugins';
+
+interface SettingsPanelProps {
+  isOpen: boolean;
+  onClose: () => void;
+}
+
+// ── Helpers ────────────────────────────────────────────
+const genId = () => Math.random().toString(36).substring(2, 9);
+
+function loadJSON<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch { return fallback; }
+}
+
+// ── Component ──────────────────────────────────────────
+export default function SettingsPanel({ isOpen, onClose }: SettingsPanelProps) {
+  const [tab, setTab] = useState<SettingsTab>('general');
+  const [theme, setTheme] = useState<'light' | 'dark' | 'system'>('light');
+  const [language, setLanguage] = useState<'zh' | 'en'>('zh');
+  const [sendShortcut, setSendShortcut] = useState<'enter' | 'ctrl-enter'>('enter');
+  const [saveHistory, setSaveHistory] = useState<boolean>(true);
+  const [showThinking, setShowThinking] = useState<boolean>(true);
+  const [skills, setSkills] = useState<Skill[]>([]);
+  const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
+  const [editingSkill, setEditingSkill] = useState<Skill | null>(null);
+  const [editingMcp, setEditingMcp] = useState<McpServer | null>(null);
+
+  // Providers and Plugins States
+  const [providers, setProviders] = useState<Record<string, ProviderSettings>>(() => loadJSON('blankAI_providers', DEFAULT_PROVIDERS));
+
+  const [customProviders, setCustomProviders] = useState<CustomProvider[]>(() => {
+    return loadJSON('blankAI_customProviders', []);
+  });
+
+  const [plugins, setPlugins] = useState<PluginItem[]>(() => loadJSON('blankAI_plugins', DEFAULT_PLUGINS));
+
+  // Resize & Full Screen States
+  const [dimensions, setDimensions] = useState({ width: 800, height: 560 }); // Increased default size
+  const [isResizing, setIsResizing] = useState(false);
+  const [isFullScreen, setIsFullScreen] = useState(false);
+  const resizeStartRef = React.useRef<{ mouseX: number; mouseY: number; width: number; height: number } | null>(null);
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    e.preventDefault();
+    if (isFullScreen) return;
+    resizeStartRef.current = {
+      mouseX: e.clientX,
+      mouseY: e.clientY,
+      width: dimensions.width,
+      height: dimensions.height
+    };
+    setIsResizing(true);
+  };
+
+  useEffect(() => {
+    if (!isResizing) return;
+
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!resizeStartRef.current) return;
+      const { mouseX, mouseY, width, height } = resizeStartRef.current;
+      const deltaX = e.clientX - mouseX;
+      const deltaY = e.clientY - mouseY;
+
+      // Symmetrical scaling keeps modal centered perfectly
+      const newWidth = Math.max(680, Math.min(window.innerWidth - 40, width + 2 * deltaX));
+      const newHeight = Math.max(480, Math.min(window.innerHeight - 40, height + 2 * deltaY));
+
+      setDimensions({ width: newWidth, height: newHeight });
+    };
+
+    const handleMouseUp = () => {
+      setIsResizing(false);
+      resizeStartRef.current = null;
+    };
+
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [isResizing, isFullScreen]);
+
+  // Panel Drag States
+  const [position, setPosition] = useState({ x: 0, y: 0 });
+  const [isDraggingPanel, setIsDraggingPanel] = useState(false);
+  const dragPanelStartRef = React.useRef<{ mouseX: number; mouseY: number; startX: number; startY: number } | null>(null);
+
+  const handleHeaderMouseDown = (e: React.MouseEvent) => {
+    if (e.button !== 0 || isFullScreen) return; // Only left click, no drag in full screen
+    const target = e.target as HTMLElement;
+    if (target.closest('button')) return; // Don't drag if clicking buttons
+
+    dragPanelStartRef.current = {
+      mouseX: e.clientX,
+      mouseY: e.clientY,
+      startX: position.x,
+      startY: position.y
+    };
+    setIsDraggingPanel(true);
+  };
+
+  useEffect(() => {
+    if (!isDraggingPanel) return;
+
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!dragPanelStartRef.current) return;
+      const { mouseX, mouseY, startX, startY } = dragPanelStartRef.current;
+      const deltaX = e.clientX - mouseX;
+      const deltaY = e.clientY - mouseY;
+
+      setPosition({
+        x: startX + deltaX,
+        y: startY + deltaY
+      });
+    };
+
+    const handleMouseUp = () => {
+      setIsDraggingPanel(false);
+      dragPanelStartRef.current = null;
+    };
+
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [isDraggingPanel]);
+
+  // Reset position & fullscreen on open
+  useEffect(() => {
+    if (isOpen) {
+      setPosition({ x: 0, y: 0 });
+      setIsFullScreen(false);
+    }
+  }, [isOpen]);
+
+  // Load from localStorage on mount
+  useEffect(() => {
+    setTheme(loadJSON('blankAI_theme', 'light'));
+    setLanguage(loadJSON('blankAI_language', 'zh'));
+    setSendShortcut(loadJSON('blankAI_sendShortcut', 'enter'));
+    setSaveHistory(loadJSON('blankAI_saveHistory', true));
+    setShowThinking(loadJSON('blankAI_showThinking', true));
+    setSkills(loadJSON('blankAI_skills', []));
+    setMcpServers(loadJSON('blankAI_mcpServers', []));
+    const savedProviders = loadJSON('blankAI_providers', DEFAULT_PROVIDERS);
+    setProviders(savedProviders);
+
+    // Read real keys from Electron
+    const api = (window as any).api;
+    if (api && api.getEnv) {
+      api.getEnv().then((env: Record<string, string>) => {
+        setProviders(prev => mergeProvidersWithEnv(prev, customProviders, env));
+      }).catch((err: any) => console.error('Failed to getEnv:', err));
+    }
+    setPlugins(loadJSON('blankAI_plugins', DEFAULT_PLUGINS));
+  }, []);
+
+  // Persist on change
+  useEffect(() => { localStorage.setItem('blankAI_theme', JSON.stringify(theme)); }, [theme]);
+  useEffect(() => { localStorage.setItem('blankAI_language', JSON.stringify(language)); }, [language]);
+  useEffect(() => { localStorage.setItem('blankAI_sendShortcut', JSON.stringify(sendShortcut)); }, [sendShortcut]);
+  useEffect(() => { localStorage.setItem('blankAI_saveHistory', JSON.stringify(saveHistory)); }, [saveHistory]);
+  useEffect(() => { localStorage.setItem('blankAI_showThinking', JSON.stringify(showThinking)); }, [showThinking]);
+  useEffect(() => {
+    localStorage.setItem('blankAI_skills', JSON.stringify(skills));
+    const api = (window as any).api;
+    if (api && api.syncSkills) {
+      api.syncSkills(skills).then((res: any) => {
+        console.log('[React Skills Sync]', res);
+      }).catch((err: any) => {
+        console.error('[React Skills Sync Error]', err);
+      });
+    }
+  }, [skills]);
+  useEffect(() => { localStorage.setItem('blankAI_mcpServers', JSON.stringify(mcpServers)); }, [mcpServers]);
+  useEffect(() => { localStorage.setItem('blankAI_providers', JSON.stringify(providers)); }, [providers]);
+  useEffect(() => { localStorage.setItem('blankAI_customProviders', JSON.stringify(customProviders)); }, [customProviders]);
+  useEffect(() => { localStorage.setItem('blankAI_plugins', JSON.stringify(plugins)); }, [plugins]);
+
+  // Reset editing state when switching tabs or closing
+  const switchTab = (t: SettingsTab) => { setTab(t); setEditingSkill(null); setEditingMcp(null); };
+  const handleClose = () => { setEditingSkill(null); setEditingMcp(null); onClose(); };
+
+  // CRUD
+  const saveSkill = (s: Skill) => {
+    setSkills(prev => prev.find(x => x.id === s.id) ? prev.map(x => x.id === s.id ? s : x) : [...prev, s]);
+    setEditingSkill(null);
+  };
+  const saveMcp = (s: McpServer) => {
+    setMcpServers(prev => prev.find(x => x.id === s.id) ? prev.map(x => x.id === s.id ? s : x) : [...prev, s]);
+    setEditingMcp(null);
+  };
+
+  if (!isOpen) return null;
+
+  const tabs: { key: SettingsTab; label: string; icon: React.ReactNode }[] = [
+    { key: 'general', label: '通用设置', icon: <Settings size={16} /> },
+    { key: 'providers', label: '提供商', icon: <Cpu size={16} /> },
+    { key: 'skills', label: 'Skills', icon: <Sparkles size={16} /> },
+    { key: 'mcp', label: 'MCP', icon: <Plug2 size={16} /> },
+    { key: 'plugins', label: '插件', icon: <Puzzle size={16} /> },
+  ];
+
+  return (
+    <div className="fixed inset-0 z-[100000] flex items-center justify-center">
+      {/* Backdrop */}
+      <div className="absolute inset-0 bg-black/20 backdrop-blur-sm settings-backdrop-enter" onClick={handleClose} />
+
+      {/* Panel */}
+      <div 
+        id="settings-drag-panel"
+        style={
+          isFullScreen 
+            ? { width: '100vw', height: '100vh', maxWidth: '100vw', maxHeight: '100vh', userSelect: (isResizing || isDraggingPanel) ? 'none' : 'auto', WebkitAppRegion: 'no-drag' } as any
+            : { 
+                width: `${dimensions.width}px`, 
+                height: `${dimensions.height}px`, 
+                left: `${position.x}px`,
+                top: `${position.y}px`,
+                userSelect: (isResizing || isDraggingPanel) ? 'none' : 'auto',
+                WebkitAppRegion: 'no-drag'
+              } as any
+        }
+        className={`relative bg-white shadow-2xl flex flex-col settings-panel-enter overflow-hidden border border-gray-100 ${
+          isResizing || isDraggingPanel ? '' : 'transition-all duration-200'
+        } ${isFullScreen ? 'rounded-none' : 'rounded-2xl max-w-[95vw] max-h-[90vh]'}`}
+      >
+        {/* Header */}
+        <div 
+          onMouseDown={handleHeaderMouseDown}
+          className={`flex items-center justify-between px-6 py-4 border-b border-gray-100 flex-shrink-0 select-none ${
+            isFullScreen ? 'cursor-default' : 'cursor-move active:cursor-grabbing'
+          }`}
+        >
+          <div className="flex items-center gap-2">
+            <h2 className="text-[16px] font-semibold text-gray-800">系统设置</h2>
+            {isFullScreen && (
+              <span className="text-[9px] font-bold text-cyan-600 bg-cyan-50 px-1.5 py-0.5 rounded-md tracking-wider">全屏模式</span>
+            )}
+          </div>
+          <div className={`flex items-center gap-1 transition-all duration-200 ${isFullScreen ? 'mr-[140px]' : ''}`}>
+            <button 
+              onClick={() => setIsFullScreen(!isFullScreen)} 
+              className="text-gray-400 hover:text-gray-800 transition-colors p-1.5 rounded-lg hover:bg-gray-100"
+              title={isFullScreen ? "还原大小" : "最大化全屏"}
+            >
+              {isFullScreen ? <Minimize2 size={16} strokeWidth={2} /> : <Maximize2 size={16} strokeWidth={2} />}
+            </button>
+            <button onClick={handleClose} className="text-gray-400 hover:text-gray-800 transition-colors p-1.5 rounded-lg hover:bg-gray-100" title="关闭">
+              <X size={18} strokeWidth={2} />
+            </button>
+          </div>
+        </div>
+
+        {/* Body */}
+        <div className="flex flex-1 min-h-0 relative">
+          {/* Left Nav */}
+          <div className="w-[160px] border-r border-gray-100 p-3 flex flex-col gap-1 select-none flex-shrink-0">
+            {tabs.map(t => (
+              <button
+                key={t.key}
+                onClick={() => switchTab(t.key)}
+                className={`flex items-center gap-2.5 px-3 py-2 rounded-lg text-[14px] transition-all w-full text-left ${
+                  tab === t.key ? 'bg-gray-100 text-gray-900 font-medium' : 'text-gray-500 hover:text-gray-800 hover:bg-gray-50'
+                }`}
+              >
+                {t.icon}
+                {t.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Right Content */}
+          <div className="flex-1 p-6 overflow-y-auto">
+            {tab === 'general' && (
+              <GeneralTab 
+                theme={theme} 
+                setTheme={setTheme}
+                language={language}
+                setLanguage={setLanguage}
+                sendShortcut={sendShortcut}
+                setSendShortcut={setSendShortcut}
+                saveHistory={saveHistory}
+                setSaveHistory={setSaveHistory}
+                showThinking={showThinking}
+                setShowThinking={setShowThinking}
+              />
+            )}
+            {tab === 'providers' && (
+              <ProvidersTab 
+                providers={providers}
+                setProviders={setProviders}
+                customProviders={customProviders}
+                setCustomProviders={setCustomProviders}
+              />
+            )}
+            {tab === 'skills' && (
+              editingSkill
+                ? <SkillForm skill={editingSkill} onChange={setEditingSkill} onSave={saveSkill} onCancel={() => setEditingSkill(null)} isNew={!skills.find(s => s.id === editingSkill.id)} />
+                : <SkillList skills={skills} setSkills={setSkills} onEdit={s => setEditingSkill({...s})} onAdd={() => setEditingSkill({ id: genId(), name: '', description: '', content: '', enabled: true })} onDelete={id => setSkills(p => p.filter(s => s.id !== id))} />
+            )}
+            {tab === 'mcp' && (
+              editingMcp
+                ? <McpForm server={editingMcp} onChange={setEditingMcp} onSave={saveMcp} onCancel={() => setEditingMcp(null)} isNew={!mcpServers.find(s => s.id === editingMcp.id)} />
+                : <McpList servers={mcpServers} setServers={setMcpServers} onEdit={s => setEditingMcp({...s})} onAdd={() => setEditingMcp({ id: genId(), name: '', command: '', args: [], env: {}, enabled: true })} onDelete={id => setMcpServers(p => p.filter(s => s.id !== id))} />
+            )}
+            {tab === 'plugins' && (
+              <PluginsTab 
+                plugins={plugins}
+                setPlugins={setPlugins}
+              />
+            )}
+          </div>
+        </div>
+        
+        {/* Symmetrical Drag Resize Handle (Bottom-Right) */}
+        {!isFullScreen && (
+          <div 
+            className="absolute bottom-1 right-1 w-3.5 h-3.5 cursor-se-resize z-50 flex items-end justify-end pointer-events-auto select-none"
+            onMouseDown={handleMouseDown}
+            title="拖拽可自定义调节面板大小"
+          >
+            <svg width="10" height="10" viewBox="0 0 10 10" className="text-gray-300 hover:text-gray-500 transition-colors">
+              <line x1="8" y1="2" x2="2" y2="8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+              <line x1="8" y1="5" x2="5" y2="8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+            </svg>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Sub-components ─────────────────────────────────────
+
+function GeneralTab({ 
+  theme, setTheme, 
+  language, setLanguage,
+  sendShortcut, setSendShortcut,
+  saveHistory, setSaveHistory,
+  showThinking, setShowThinking
+}: { 
+  theme: string; setTheme: (t: 'light' | 'dark' | 'system') => void;
+  language: 'zh' | 'en'; setLanguage: (l: 'zh' | 'en') => void;
+  sendShortcut: 'enter' | 'ctrl-enter'; setSendShortcut: (s: 'enter' | 'ctrl-enter') => void;
+  saveHistory: boolean; setSaveHistory: (b: boolean) => void;
+  showThinking: boolean; setShowThinking: (b: boolean) => void;
+}) {
+  const options = [
+    { key: 'light', label: '浅色模式', icon: <Sun size={20} /> },
+    { key: 'dark', label: '深色模式', icon: <Moon size={20} /> },
+    { key: 'system', label: '跟随系统', icon: <Monitor size={20} /> },
+  ] as const;
+
+  return (
+    <div className="flex flex-col gap-6 select-none animate-fadeIn">
+      {/* Theme Section */}
+      <div>
+        <h3 className="text-[13px] text-gray-400 uppercase tracking-wider mb-2.5 select-none font-semibold">界面外观</h3>
+        <div className="flex gap-3">
+          {options.map(t => (
+            <button
+              key={t.key}
+              onClick={() => setTheme(t.key)}
+              className={`flex flex-col items-center gap-2 px-5 py-3 rounded-xl border transition-all cursor-pointer flex-1 ${
+                theme === t.key
+                  ? 'border-gray-800 bg-gray-50/50 text-gray-900 font-medium shadow-sm'
+                  : 'border-gray-100 text-gray-400 hover:border-gray-200 hover:text-gray-600 bg-white'
+              }`}
+            >
+              {t.icon}
+              <span className="text-[13px]">{t.label}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Row 1: Language & Send Shortcut */}
+      <div className="grid grid-cols-2 gap-5">
+        {/* Language */}
+        <div>
+          <h3 className="text-[13px] text-gray-400 uppercase tracking-wider mb-2.5 select-none font-semibold">语言设置</h3>
+          <div className="relative">
+            <select
+              value={language}
+              onChange={e => setLanguage(e.target.value as 'zh' | 'en')}
+              className="w-full px-3.5 py-2.5 bg-white border border-gray-200 hover:border-gray-300 rounded-xl text-[14px] text-gray-700 outline-none transition-colors cursor-pointer appearance-none shadow-sm"
+            >
+              <option value="zh">简体中文 (Chinese)</option>
+              <option value="en">English (US)</option>
+            </select>
+            <div className="absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none text-gray-400">
+              <svg width="10" height="6" viewBox="0 0 10 6" fill="none" stroke="currentColor" strokeWidth="1.5">
+                <path d="M1 1L5 5L9 1" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+            </div>
+          </div>
+        </div>
+
+        {/* Send Shortcut */}
+        <div>
+          <h3 className="text-[13px] text-gray-400 uppercase tracking-wider mb-2.5 select-none font-semibold">发送快捷键</h3>
+          <div className="relative">
+            <select
+              value={sendShortcut}
+              onChange={e => setSendShortcut(e.target.value as 'enter' | 'ctrl-enter')}
+              className="w-full px-3.5 py-2.5 bg-white border border-gray-200 hover:border-gray-300 rounded-xl text-[14px] text-gray-700 outline-none transition-colors cursor-pointer appearance-none shadow-sm"
+            >
+              <option value="enter">Enter 发送 / Shift+Enter 换行</option>
+              <option value="ctrl-enter">Ctrl + Enter 发送 / Enter 换行</option>
+            </select>
+            <div className="absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none text-gray-400">
+              <svg width="10" height="6" viewBox="0 0 10 6" fill="none" stroke="currentColor" strokeWidth="1.5">
+                <path d="M1 1L5 5L9 1" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Switches */}
+      <div>
+        <h3 className="text-[13px] text-gray-400 uppercase tracking-wider mb-2.5 select-none font-semibold">功能偏好</h3>
+        <div className="flex flex-col gap-3.5 border border-gray-100 rounded-2xl p-4 bg-gray-50/20">
+          <div className="flex items-center justify-between">
+            <div className="flex flex-col gap-0.5">
+              <h4 className="text-[14px] text-gray-700 font-medium">显示模型思考过程</h4>
+              <p className="text-[12px] text-gray-400">开启后，主聊天窗口将渲染大模型的思考状态与推理详情</p>
+            </div>
+            <Toggle on={showThinking} onToggle={() => setShowThinking(!showThinking)} />
+          </div>
+
+          <div className="h-px bg-gray-100/60" />
+
+          <div className="flex items-center justify-between">
+            <div className="flex flex-col gap-0.5">
+              <h4 className="text-[14px] text-gray-700 font-medium">自动保存对话历史</h4>
+              <p className="text-[12px] text-gray-400">在本地离线自动记录您所有的会话，以供随时在侧边栏中查阅</p>
+            </div>
+            <Toggle on={saveHistory} onToggle={() => setSaveHistory(!saveHistory)} />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Toggle Switch ──────────────────────────────────────
+function Toggle({ on, onToggle }: { on: boolean; onToggle: () => void }) {
+  return (
+    <button onClick={onToggle} className={`w-9 h-5 rounded-full transition-all relative flex-shrink-0 ${on ? 'bg-gray-800' : 'bg-gray-200'}`}>
+      <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-all ${on ? 'left-[18px]' : 'left-0.5'}`} />
+    </button>
+  );
+}
+
+// ── Skills ─────────────────────────────────────────────
+function SkillList({ skills, setSkills, onEdit, onAdd, onDelete }: {
+  skills: Skill[]; setSkills: React.Dispatch<React.SetStateAction<Skill[]>>;
+  onEdit: (s: Skill) => void; onAdd: () => void; onDelete: (id: string) => void;
+}) {
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-4">
+        <h3 className="text-[13px] text-gray-400 uppercase tracking-wider select-none">Skills</h3>
+        <button onClick={onAdd} className="flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-gray-600 hover:text-gray-900 bg-gray-50 hover:bg-gray-100 rounded-lg transition-all">
+          <Plus size={14} /> Add
+        </button>
+      </div>
+      {skills.length === 0 ? (
+        <div className="text-center py-16 text-gray-300 text-[14px] select-none">No skills configured yet</div>
+      ) : (
+        <div className="flex flex-col gap-2">
+          {skills.map(skill => (
+            <div key={skill.id} className="flex items-center justify-between p-3 rounded-xl border border-gray-100 hover:border-gray-200 transition-all">
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <Sparkles size={14} className="text-gray-400 flex-shrink-0" />
+                  <span className="text-[14px] font-medium text-gray-700 truncate">{skill.name}</span>
+                </div>
+                {skill.description && <p className="text-[12px] text-gray-400 mt-0.5 ml-[22px] truncate">{skill.description}</p>}
+              </div>
+              <div className="flex items-center gap-1 ml-3 flex-shrink-0">
+                <button onClick={() => onEdit(skill)} className="p-1.5 text-gray-300 hover:text-gray-600 rounded-lg hover:bg-gray-50 transition-all"><Pencil size={14} /></button>
+                <button onClick={() => onDelete(skill.id)} className="p-1.5 text-gray-300 hover:text-red-500 rounded-lg hover:bg-red-50 transition-all"><Trash2 size={14} /></button>
+                <Toggle on={skill.enabled} onToggle={() => setSkills(p => p.map(s => s.id === skill.id ? {...s, enabled: !s.enabled} : s))} />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SkillForm({ skill, onChange, onSave, onCancel, isNew }: {
+  skill: Skill; onChange: (s: Skill) => void; onSave: (s: Skill) => void; onCancel: () => void; isNew: boolean;
+}) {
+  return (
+    <div>
+      <h3 className="text-[13px] text-gray-400 uppercase tracking-wider mb-4 select-none">{isNew ? 'New Skill' : 'Edit Skill'}</h3>
+      <div className="flex flex-col gap-4">
+        <Field label="Name" placeholder="e.g. Code Review Assistant" value={skill.name} onChange={v => onChange({...skill, name: v})} />
+        <Field label="Description" placeholder="Brief description" value={skill.description} onChange={v => onChange({...skill, description: v})} />
+        <div>
+          <label className="text-[12px] text-gray-500 mb-1.5 block select-none">Skill Instructions</label>
+          <textarea
+            value={skill.content}
+            onChange={e => onChange({...skill, content: e.target.value})}
+            placeholder="Enter the skill instructions or system prompt..."
+            rows={6}
+            className="w-full px-3 py-2 rounded-lg border border-gray-200 text-[14px] text-gray-800 placeholder:text-gray-300 outline-none focus:border-gray-400 transition-colors resize-none font-mono leading-relaxed"
+          />
+        </div>
+        <FormActions onCancel={onCancel} onSave={() => { if (skill.name.trim()) onSave(skill); }} disabled={!skill.name.trim()} />
+      </div>
+    </div>
+  );
+}
+
+// ── MCP ────────────────────────────────────────────────
+function McpList({ servers, setServers, onEdit, onAdd, onDelete }: {
+  servers: McpServer[]; setServers: React.Dispatch<React.SetStateAction<McpServer[]>>;
+  onEdit: (s: McpServer) => void; onAdd: () => void; onDelete: (id: string) => void;
+}) {
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-4">
+        <h3 className="text-[13px] text-gray-400 uppercase tracking-wider select-none">MCP Servers</h3>
+        <button onClick={onAdd} className="flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-gray-600 hover:text-gray-900 bg-gray-50 hover:bg-gray-100 rounded-lg transition-all">
+          <Plus size={14} /> Add
+        </button>
+      </div>
+      {servers.length === 0 ? (
+        <div className="text-center py-16 text-gray-300 text-[14px] select-none">No MCP servers configured yet</div>
+      ) : (
+        <div className="flex flex-col gap-2">
+          {servers.map(server => (
+            <div key={server.id} className="flex items-center justify-between p-3 rounded-xl border border-gray-100 hover:border-gray-200 transition-all">
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <Plug2 size={14} className="text-gray-400 flex-shrink-0" />
+                  <span className="text-[14px] font-medium text-gray-700 truncate">{server.name}</span>
+                </div>
+                <p className="text-[12px] text-gray-400 mt-0.5 ml-[22px] truncate font-mono">{server.command} {server.args.join(' ')}</p>
+              </div>
+              <div className="flex items-center gap-1 ml-3 flex-shrink-0">
+                <button onClick={() => onEdit(server)} className="p-1.5 text-gray-300 hover:text-gray-600 rounded-lg hover:bg-gray-50 transition-all"><Pencil size={14} /></button>
+                <button onClick={() => onDelete(server.id)} className="p-1.5 text-gray-300 hover:text-red-500 rounded-lg hover:bg-red-50 transition-all"><Trash2 size={14} /></button>
+                <Toggle on={server.enabled} onToggle={() => setServers(p => p.map(s => s.id === server.id ? {...s, enabled: !s.enabled} : s))} />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function McpForm({ server, onChange, onSave, onCancel, isNew }: {
+  server: McpServer; onChange: (s: McpServer) => void; onSave: (s: McpServer) => void; onCancel: () => void; isNew: boolean;
+}) {
+  const argsText = server.args.join('\n');
+  const envText = Object.entries(server.env).map(([k, v]) => `${k}=${v}`).join('\n');
+
+  return (
+    <div>
+      <h3 className="text-[13px] text-gray-400 uppercase tracking-wider mb-4 select-none">{isNew ? 'New MCP Server' : 'Edit MCP Server'}</h3>
+      <div className="flex flex-col gap-4">
+        <Field label="Name" placeholder="e.g. filesystem" value={server.name} onChange={v => onChange({...server, name: v})} />
+        <Field label="Command" placeholder="e.g. npx, node, python" value={server.command} onChange={v => onChange({...server, command: v})} />
+        <div>
+          <label className="text-[12px] text-gray-500 mb-1.5 block select-none">Arguments <span className="text-gray-300">(one per line)</span></label>
+          <textarea
+            value={argsText}
+            onChange={e => onChange({...server, args: e.target.value.split('\n').filter(Boolean)})}
+            placeholder={"-y\n@anthropic/mcp-server-filesystem\n/path/to/dir"}
+            rows={3}
+            className="w-full px-3 py-2 rounded-lg border border-gray-200 text-[14px] text-gray-800 placeholder:text-gray-300 outline-none focus:border-gray-400 transition-colors resize-none font-mono leading-relaxed"
+          />
+        </div>
+        <div>
+          <label className="text-[12px] text-gray-500 mb-1.5 block select-none">Environment Variables <span className="text-gray-300">(KEY=VALUE per line)</span></label>
+          <textarea
+            value={envText}
+            onChange={e => {
+              const env: Record<string, string> = {};
+              e.target.value.split('\n').forEach(line => {
+                const idx = line.indexOf('=');
+                if (idx > 0) env[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
+              });
+              onChange({...server, env});
+            }}
+            placeholder={"API_KEY=xxx\nDEBUG=true"}
+            rows={2}
+            className="w-full px-3 py-2 rounded-lg border border-gray-200 text-[14px] text-gray-800 placeholder:text-gray-300 outline-none focus:border-gray-400 transition-colors resize-none font-mono leading-relaxed"
+          />
+        </div>
+        <FormActions onCancel={onCancel} onSave={() => { if (server.name.trim() && server.command.trim()) onSave(server); }} disabled={!server.name.trim() || !server.command.trim()} />
+      </div>
+    </div>
+  );
+}
+
+// ── Shared form primitives ─────────────────────────────
+function Field({ label, placeholder, value, onChange }: { label: string; placeholder: string; value: string; onChange: (v: string) => void }) {
+  return (
+    <div>
+      <label className="text-[12px] text-gray-500 mb-1.5 block select-none">{label}</label>
+      <input
+        type="text"
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        placeholder={placeholder}
+        className="w-full px-3 py-2 rounded-lg border border-gray-200 text-[14px] text-gray-800 placeholder:text-gray-300 outline-none focus:border-gray-400 transition-colors"
+      />
+    </div>
+  );
+}
+
+function FormActions({ onCancel, onSave, disabled }: { onCancel: () => void; onSave: () => void; disabled: boolean }) {
+  return (
+    <div className="flex gap-2 justify-end pt-2">
+      <button onClick={onCancel} className="px-4 py-2 text-[13px] text-gray-500 hover:text-gray-800 rounded-lg hover:bg-gray-50 transition-all">Cancel</button>
+      <button onClick={onSave} disabled={disabled} className="px-4 py-2 text-[13px] bg-gray-800 text-white rounded-lg hover:bg-gray-700 transition-all disabled:opacity-30 disabled:pointer-events-none">Save</button>
+    </div>
+  );
+}
+
+function getProviderIcon(id: string) {
+  switch (id) {
+    case 'xiaomi-token-plan-cn': return <Sparkles size={18} className="text-cyan-500" />;
+    case 'gemini': return <Sparkles size={18} className="text-indigo-500" />;
+    case 'openai': return <Cpu size={18} className="text-emerald-500" />;
+    case 'anthropic': return <Key size={18} className="text-orange-500" />;
+    case 'deepseek': return <Puzzle size={18} className="text-blue-500" />;
+    default: return <Cpu size={18} className="text-gray-500" />;
+  }
+}
+
+function ProvidersTab({
+  providers,
+  setProviders,
+  customProviders,
+  setCustomProviders,
+}: {
+  providers: Record<string, ProviderSettings>;
+  setProviders: React.Dispatch<React.SetStateAction<Record<string, ProviderSettings>>>;
+  customProviders: CustomProvider[];
+  setCustomProviders: React.Dispatch<React.SetStateAction<CustomProvider[]>>;
+}) {
+  const [showKeys, setShowKeys] = useState<Record<string, boolean>>({});
+  const [testing, setTesting] = useState<Record<string, 'idle' | 'loading' | 'success' | 'error'>>({});
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved'>('idle');
+
+  // Form states for adding custom provider
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [newProviderName, setNewProviderName] = useState('');
+  const [newProviderDesc, setNewProviderDesc] = useState('');
+  const [newProviderBaseUrl, setNewProviderBaseUrl] = useState('');
+
+  const fullProviderList: {
+    id: string;
+    name: string;
+    desc: string;
+    icon: React.ReactNode;
+    placeholderUrl: string;
+    isCustom?: boolean;
+  }[] = [
+    ...BUILTIN_PROVIDERS.map(p => ({
+      ...p,
+      icon: getProviderIcon(p.id),
+      isCustom: false,
+    })),
+    ...customProviders.map(p => ({
+      id: p.id,
+      name: p.name,
+      desc: p.desc,
+      icon: <Cpu size={18} className="text-gray-500" />,
+      placeholderUrl: p.placeholderUrl,
+      isCustom: true
+    }))
+  ];
+
+  const toggleProvider = (id: string) => {
+    setProviders(prev => ({
+      ...prev,
+      [id]: { ...prev[id], enabled: !prev[id]?.enabled }
+    }));
+  };
+
+  const handleApiKeyChange = (id: string, value: string) => {
+    setProviders(prev => ({
+      ...prev,
+      [id]: { ...prev[id], apiKey: value }
+    }));
+  };
+
+  const handleBaseUrlChange = (id: string, value: string) => {
+    setProviders(prev => ({
+      ...prev,
+      [id]: { ...prev[id], baseUrl: value }
+    }));
+  };
+
+  const toggleShowKey = (id: string) => {
+    setShowKeys(prev => ({ ...prev, [id]: !prev[id] }));
+  };
+
+  const testConnection = (id: string) => {
+    setTesting(prev => ({ ...prev, [id]: 'loading' }));
+    setTimeout(() => {
+      const key = providers[id]?.apiKey;
+      if (key && key.trim().length > 5) {
+        setTesting(prev => ({ ...prev, [id]: 'success' }));
+      } else {
+        setTesting(prev => ({ ...prev, [id]: 'error' }));
+      }
+      setTimeout(() => {
+        setTesting(prev => ({ ...prev, [id]: 'idle' }));
+      }, 3000);
+    }, 1200);
+  };
+
+  const handleAddCustomProvider = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newProviderName.trim()) return;
+
+    const safeName = newProviderName.trim();
+    const cleanIdSuffix = safeName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    const newId = `custom-${cleanIdSuffix}-${Date.now().toString().slice(-4)}`;
+
+    setCustomProviders(prev => [
+      ...prev,
+      { id: newId, name: safeName, desc: newProviderDesc.trim() || '自定义接口兼容模型服务商', placeholderUrl: newProviderBaseUrl.trim() || 'https://api.example.com' }
+    ]);
+
+    setProviders(prev => ({
+      ...prev,
+      [newId]: { enabled: true, apiKey: '', baseUrl: newProviderBaseUrl.trim() }
+    }));
+
+    setNewProviderName('');
+    setNewProviderDesc('');
+    setNewProviderBaseUrl('');
+    setShowAddForm(false);
+  };
+
+  const handleDeleteCustomProvider = (id: string) => {
+    if (confirm('确定要删除这个自定义提供商吗？')) {
+      setCustomProviders(prev => prev.filter(x => x.id !== id));
+      setProviders(prev => {
+        const copy = { ...prev };
+        delete copy[id];
+        return copy;
+      });
+    }
+  };
+
+  const handleSave = () => {
+    setSaveStatus('saving');
+    const api = (window as any).api;
+    if (api && api.saveEnv) {
+      api.saveEnv(providersToEnv(providers, customProviders)).then((res: any) => {
+        setSaveStatus('saved');
+        setTimeout(() => setSaveStatus('idle'), 2500);
+      }).catch((err: any) => {
+        console.error('Failed to save env:', err);
+        setSaveStatus('idle');
+        alert('保存配置失败，请查看控制台日志');
+      });
+    } else {
+      setSaveStatus('saved');
+      setTimeout(() => setSaveStatus('idle'), 2500);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-5 select-none animate-fadeIn">
+      <div className="flex justify-between items-center">
+        <div>
+          <h3 className="text-[13px] text-gray-400 uppercase tracking-wider mb-1 font-semibold">模型提供商</h3>
+          <p className="text-[12px] text-gray-400">配置您的 API 密钥及代理服务基准端点</p>
+        </div>
+        <button 
+          onClick={() => setShowAddForm(!showAddForm)}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-gray-600 hover:text-gray-900 bg-gray-50 hover:bg-gray-100 border border-gray-100 rounded-xl transition-all"
+        >
+          {showAddForm ? <X size={14} /> : <Plus size={14} />}
+          {showAddForm ? '取消' : '添加自定义'}
+        </button>
+      </div>
+
+      {showAddForm && (
+        <form onSubmit={handleAddCustomProvider} className="border border-indigo-100 bg-indigo-50/10 rounded-2xl p-4 flex flex-col gap-3.5 animate-slideDown">
+          <div className="flex justify-between items-center">
+            <h4 className="text-[13px] font-bold text-indigo-950 flex items-center gap-1.5">
+              <Plus size={15} /> 新增自定义提供商
+            </h4>
+          </div>
+          
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="text-[11px] text-gray-400 font-medium mb-1 block">提供商名称 (必填)</label>
+              <input 
+                type="text" 
+                required
+                value={newProviderName}
+                onChange={e => setNewProviderName(e.target.value)}
+                placeholder="例如: OpenRouter, 自建代理" 
+                className="w-full px-3 py-2 bg-white border border-gray-200 focus:border-indigo-400 rounded-xl text-[13px] text-gray-700 outline-none transition-all"
+              />
+            </div>
+            <div>
+              <label className="text-[11px] text-gray-400 font-medium mb-1 block">默认 Base URL (可选)</label>
+              <input 
+                type="text" 
+                value={newProviderBaseUrl}
+                onChange={e => setNewProviderBaseUrl(e.target.value)}
+                placeholder="例如: https://openrouter.ai/api/v1" 
+                className="w-full px-3 py-2 bg-white border border-gray-200 focus:border-indigo-400 rounded-xl text-[13px] text-gray-700 outline-none transition-all font-mono"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="text-[11px] text-gray-400 font-medium mb-1 block">一句话简短描述</label>
+            <input 
+              type="text" 
+              value={newProviderDesc}
+              onChange={e => setNewProviderDesc(e.target.value)}
+              placeholder="说明此提供商的用途或包含的模型系列" 
+              className="w-full px-3 py-2 bg-white border border-gray-200 focus:border-indigo-400 rounded-xl text-[13px] text-gray-700 outline-none transition-all"
+            />
+          </div>
+
+          <div className="flex justify-end pt-1">
+            <button 
+              type="submit"
+              className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-[13px] font-semibold transition-all shadow-sm"
+            >
+              创建提供商
+            </button>
+          </div>
+        </form>
+      )}
+
+      <div className="flex flex-col gap-4 max-h-[350px] overflow-y-auto pr-1.5 custom-scrollbar">
+        {fullProviderList.map(p => {
+          const config = providers[p.id] || { enabled: false, apiKey: '', baseUrl: '' };
+          const isKeyVisible = showKeys[p.id];
+          const testStatus = testing[p.id] || 'idle';
+
+          return (
+            <div key={p.id} className={`border rounded-2xl p-4 transition-all duration-200 bg-white ${config.enabled ? 'border-gray-300 shadow-sm' : 'border-gray-100 opacity-60'}`}>
+              <div className="flex items-center justify-between mb-3.5">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-gray-50 rounded-xl">
+                    {p.icon}
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h4 className="text-[14px] font-semibold text-gray-800">{p.name}</h4>
+                      {p.isCustom && (
+                        <span className="text-[9px] font-bold text-indigo-600 bg-indigo-50 px-1.5 py-0.5 rounded-md tracking-wider">自定义</span>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-gray-400">{p.desc}</p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2.5">
+                  {p.isCustom && (
+                    <button 
+                      onClick={() => handleDeleteCustomProvider(p.id)}
+                      className="p-1.5 text-gray-300 hover:text-rose-500 rounded-lg hover:bg-rose-50 transition-all"
+                      title="删除此自定义提供商"
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  )}
+                  <Toggle on={config.enabled} onToggle={() => toggleProvider(p.id)} />
+                </div>
+              </div>
+
+              {config.enabled && (
+                <div className="flex flex-col gap-3.5 mt-3 pt-3.5 border-t border-dashed border-gray-100 animate-fadeIn">
+                  <div>
+                    <label className="text-[11px] text-gray-400 font-medium mb-1.5 block">API 密钥 (API Key)</label>
+                    <div className="relative">
+                      <input
+                        type={isKeyVisible ? 'text' : 'password'}
+                        value={config.apiKey}
+                        onChange={e => handleApiKeyChange(p.id, e.target.value)}
+                        placeholder={`请输入您的 ${p.name} API 密钥`}
+                        className="w-full pl-3.5 pr-10 py-2.5 bg-gray-50/50 hover:bg-gray-50 border border-gray-200 focus:border-gray-400 rounded-xl text-[13px] text-gray-700 outline-none transition-all font-mono"
+                      />
+                      <button
+                        onClick={() => toggleShowKey(p.id)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 transition-colors p-1"
+                      >
+                        {isKeyVisible ? <EyeOff size={15} /> : <Eye size={15} />}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-3 items-end">
+                    <div className="col-span-2">
+                      <label className="text-[11px] text-gray-400 font-medium mb-1.5 block">自定义 Endpoint (Base URL)</label>
+                      <input
+                        type="text"
+                        value={config.baseUrl}
+                        onChange={e => handleBaseUrlChange(p.id, e.target.value)}
+                        placeholder={p.placeholderUrl}
+                        className="w-full px-3.5 py-2.5 bg-gray-50/50 hover:bg-gray-50 border border-gray-200 focus:border-gray-400 rounded-xl text-[13px] text-gray-700 outline-none transition-all font-mono"
+                      />
+                    </div>
+
+                    <button
+                      onClick={() => testConnection(p.id)}
+                      disabled={testStatus === 'loading'}
+                      className={`h-[42px] px-3 rounded-xl border text-[13px] font-medium transition-all duration-200 flex items-center justify-center gap-1.5 ${
+                        testStatus === 'loading'
+                          ? 'bg-gray-50 border-gray-200 text-gray-400 cursor-not-allowed'
+                          : testStatus === 'success'
+                          ? 'bg-emerald-50 border-emerald-200 text-emerald-600'
+                          : testStatus === 'error'
+                          ? 'bg-rose-50 border-rose-200 text-rose-600'
+                          : 'bg-white hover:bg-gray-50 border-gray-200 hover:border-gray-300 text-gray-600'
+                      }`}
+                    >
+                      {testStatus === 'loading' ? (
+                        <>
+                          <div className="w-3.5 h-3.5 border-2 border-gray-300 border-t-gray-600 rounded-full animate-spin" />
+                          测试中
+                        </>
+                      ) : testStatus === 'success' ? (
+                        <>
+                          <Check size={14} />
+                          成功
+                        </>
+                      ) : testStatus === 'error' ? (
+                        <>
+                          <X size={14} />
+                          失败
+                        </>
+                      ) : (
+                        '测试连接'
+                      )}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="flex justify-end pt-4 border-t border-gray-100 mt-2">
+        <button
+          onClick={handleSave}
+          disabled={saveStatus !== 'idle'}
+          className={`px-5 py-2.5 rounded-xl text-[13px] font-semibold transition-all duration-200 flex items-center gap-2 select-none shadow-sm ${
+            saveStatus === 'saving'
+              ? 'bg-gray-100 text-gray-400 cursor-not-allowed border border-gray-100'
+              : saveStatus === 'saved'
+              ? 'bg-emerald-500 hover:bg-emerald-600 text-white'
+              : 'bg-gray-900 hover:bg-gray-800 text-white active:scale-[0.98]'
+          }`}
+        >
+          {saveStatus === 'saving' ? (
+            <>
+              <div className="w-3.5 h-3.5 border-2 border-gray-300 border-t-gray-600 rounded-full animate-spin" />
+              正在保存并重启智能体...
+            </>
+          ) : saveStatus === 'saved' ? (
+            <>
+              <Check size={15} />
+              配置保存成功，服务重启中！
+            </>
+          ) : (
+            '保存并应用配置'
+          )}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Plugins Tab ─────────────────────────────────────────
+function PluginsTab({
+  plugins,
+  setPlugins,
+}: {
+  plugins: PluginItem[];
+  setPlugins: React.Dispatch<React.SetStateAction<PluginItem[]>>;
+}) {
+  const togglePlugin = (id: string) => {
+    setPlugins(prev => prev.map(p => p.id === id ? { ...p, enabled: !p.enabled } : p));
+  };
+
+  const getPluginIcon = (icon: string) => {
+    switch (icon) {
+      case 'globe': return <Globe size={18} className="text-blue-500" />;
+      case 'terminal': return <Terminal size={18} className="text-indigo-500" />;
+      case 'image': return <Image size={18} className="text-rose-500" />;
+      case 'cpu': return <Cpu size={18} className="text-amber-500" />;
+      default: return <Puzzle size={18} className="text-gray-500" />;
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-5 select-none animate-fadeIn">
+      <div className="flex items-center justify-between">
+        <div>
+          <h3 className="text-[13px] text-gray-400 uppercase tracking-wider mb-1 font-semibold">本地功能插件</h3>
+          <p className="text-[12px] text-gray-400">启用或配置您的 AI 智能体可调用的核心功能插件</p>
+        </div>
+        <button 
+          onClick={() => alert('插件市场即将开放，敬请期待！')}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-gray-600 hover:text-gray-900 bg-gray-50 hover:bg-gray-100 border border-gray-100 rounded-xl transition-all"
+        >
+          <Plus size={14} /> 插件中心
+        </button>
+      </div>
+
+      <div className="grid grid-cols-1 gap-3.5">
+        {plugins.map(p => (
+          <div key={p.id} className={`flex items-start justify-between p-4 rounded-2xl border transition-all duration-200 ${p.enabled ? 'border-gray-200 bg-white shadow-sm' : 'border-gray-100 bg-gray-50/10'}`}>
+            <div className="flex gap-3.5">
+              <div className="p-2.5 bg-gray-50 rounded-xl shrink-0 mt-0.5">
+                {getPluginIcon(p.icon)}
+              </div>
+              <div className="flex flex-col gap-0.5">
+                <div className="flex items-center gap-2">
+                  <span className="text-[14px] font-semibold text-gray-800">{p.name}</span>
+                  {p.enabled && (
+                    <span className="text-[9px] font-bold text-emerald-600 bg-emerald-50 px-1.5 py-0.5 rounded-md tracking-wider">已启用</span>
+                  )}
+                </div>
+                <p className="text-[12px] text-gray-400 leading-relaxed max-w-[420px]">{p.desc}</p>
+              </div>
+            </div>
+            <div className="flex items-center ml-4 shrink-0">
+              <Toggle on={p.enabled} onToggle={() => togglePlugin(p.id)} />
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+## FILE: src/settingsConfig.ts
+export interface ProviderSettings {
+  enabled: boolean;
+  apiKey: string;
+  baseUrl: string;
+}
+
+export interface ProviderDefinition {
+  id: string;
+  name: string;
+  desc: string;
+  placeholderUrl: string;
+  envPrefix?: string;
+}
+
+export interface CustomProvider {
+  id: string;
+  name: string;
+  desc: string;
+  placeholderUrl: string;
+}
+
+export interface PluginItem {
+  id: string;
+  name: string;
+  desc: string;
+  icon: string;
+  enabled: boolean;
+}
+
+export const BUILTIN_PROVIDERS: ProviderDefinition[] = [
+  {
+    id: 'xiaomi-token-plan-cn',
+    name: 'Xiaomi Token Plan (CN)',
+    desc: '小米 MiMo Token Plan (中国区) 提供商',
+    placeholderUrl: 'https://api.xiaomimimo.com',
+    envPrefix: 'XIAOMI_TOKEN_PLAN_CN',
+  },
+  {
+    id: 'gemini',
+    name: 'Gemini',
+    desc: 'Google DeepMind 的多模态旗舰模型服务',
+    placeholderUrl: 'https://generativelanguage.googleapis.com',
+  },
+  {
+    id: 'openai',
+    name: 'OpenAI',
+    desc: 'ChatGPT / GPT-4o 系列模型服务提供商',
+    placeholderUrl: 'https://api.openai.com/v1',
+  },
+  {
+    id: 'anthropic',
+    name: 'Anthropic',
+    desc: 'Claude 3.5 Sonnet 等高智能模型服务商',
+    placeholderUrl: 'https://api.anthropic.com/v1',
+  },
+  {
+    id: 'deepseek',
+    name: 'DeepSeek',
+    desc: '极具性价比的中国开源/闭源模型服务商',
+    placeholderUrl: 'https://api.deepseek.com/v1',
+  },
+];
+
+export const DEFAULT_PROVIDERS = Object.fromEntries(
+  BUILTIN_PROVIDERS.map(provider => [
+    provider.id,
+    {
+      enabled: provider.id === 'xiaomi-token-plan-cn',
+      apiKey: '',
+      baseUrl: provider.placeholderUrl,
+    },
+  ])
+) as Record<string, ProviderSettings>;
+
+export const DEFAULT_PLUGINS: PluginItem[] = [
+  { id: 'web_search', name: 'Web Search (网页搜索)', desc: '允许 AI 搜索实时互联网内容并获取最新网页信息', icon: 'globe', enabled: true },
+  { id: 'code_runner', name: 'Code Runner (代码执行)', desc: '允许 AI 在本地安全的沙箱中编译并执行 Python 或 JavaScript 代码', icon: 'terminal', enabled: true },
+  { id: 'image_ocr', name: 'Image OCR (图像分析与识别)', desc: '利用多模态视觉模型对图片和屏幕截图进行高精度光学字符识别', icon: 'image', enabled: true },
+  { id: 'system_auto', name: 'System Automation (系统自动化)', desc: '支持 AI 执行本地终端命令并控制窗口、应用程序', icon: 'cpu', enabled: false },
+];
+
+export function providerEnvPrefix(id: string) {
+  const builtin = BUILTIN_PROVIDERS.find(provider => provider.id === id);
+  return builtin?.envPrefix ?? id.toUpperCase().replace(/-/g, '_');
+}
+
+export function mergeProvidersWithEnv(
+  providers: Record<string, ProviderSettings>,
+  customProviders: CustomProvider[],
+  env: Record<string, string>
+) {
+  const updated = { ...providers };
+  const definitions = [
+    ...BUILTIN_PROVIDERS,
+    ...customProviders.map(provider => ({ ...provider, envPrefix: providerEnvPrefix(provider.id) })),
+  ];
+
+  for (const provider of definitions) {
+    const prefix = provider.envPrefix ?? providerEnvPrefix(provider.id);
+    const apiKey = env[`${prefix}_API_KEY`];
+    const baseUrl = env[`${prefix}_BASE_URL`];
+    const previous = providers[provider.id];
+
+    updated[provider.id] = {
+      enabled: !!apiKey || previous?.enabled || false,
+      apiKey: apiKey || previous?.apiKey || '',
+      baseUrl: baseUrl || previous?.baseUrl || provider.placeholderUrl,
+    };
+  }
+
+  return updated;
+}
+
+export function providersToEnv(
+  providers: Record<string, ProviderSettings>,
+  customProviders: CustomProvider[]
+) {
+  const envVars: Record<string, string> = {};
+  const definitions = [
+    ...BUILTIN_PROVIDERS,
+    ...customProviders.map(provider => ({ ...provider, envPrefix: providerEnvPrefix(provider.id) })),
+  ];
+
+  for (const provider of definitions) {
+    const prefix = provider.envPrefix ?? providerEnvPrefix(provider.id);
+    envVars[`${prefix}_API_KEY`] = providers[provider.id]?.apiKey || '';
+    envVars[`${prefix}_BASE_URL`] = providers[provider.id]?.baseUrl || '';
+  }
+
+  return envVars;
+}
+
+## FILE: src/index.css
+@import "tailwindcss";
+
+/* 隐藏所有的滚动条，保持画面极度纯净 */
+::-webkit-scrollbar { display: none; }
+* { -ms-overflow-style: none; scrollbar-width: none; box-sizing: border-box; }
+
+body, html { 
+    height: 100%; 
+    background-color: #ffffff; 
+    color: #000000; 
+    overscroll-behavior-y: none; /* 防止手机端下拉刷新出现空白 */
+    -webkit-tap-highlight-color: transparent; /* 去除手机端点击高亮 */
+}
+
+input:focus { outline: none; }
+
+/* 适配 iPhone 底部安全区 */
+.pb-safe { padding-bottom: max(1rem, env(safe-area-inset-bottom)); }
+.pt-safe { padding-top: max(1rem, env(safe-area-inset-top)); }
+
+.msg-enter {
+    animation: fadeIn 0.4s ease-out forwards;
+}
+
+/* 正在输入动画的三个小点 */
+.typing-dot {
+    animation: blink 1.4s infinite both;
+    height: 4px;
+    width: 4px;
+    background: #d1d5db;
+    border-radius: 50%;
+    display: inline-block;
+    margin: 0 1px;
+}
+.typing-dot:nth-child(2) { animation-delay: 0.2s; }
+.typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes blink {
+    0% { opacity: 0.2; }
+    20% { opacity: 1; }
+    100% { opacity: 0.2; }
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(5px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+/* Settings panel animations */
+.settings-backdrop-enter {
+    animation: backdropIn 0.2s ease-out forwards;
+}
+.settings-panel-enter {
+    animation: panelIn 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes backdropIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+@keyframes panelIn {
+    from { opacity: 0; transform: scale(0.96) translateY(8px); }
+    to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+/* Popover menu animation */
+.animate-popover-in {
+    animation: popoverIn 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    transform-origin: bottom right;
+}
+
+@keyframes popoverIn {
+    from { opacity: 0; transform: scale(0.95) translateY(6px); }
+    to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+/* Custom mini scrollbar for models list */
+.custom-scrollbar::-webkit-scrollbar {
+    display: block !important;
+    width: 4px !important;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent !important;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+    background: #e4e4e7 !important;
+    border-radius: 9999px !important;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: #d4d4d8 !important;
+}
+
+/* Custom form animation */
+.animate-slideDown {
+    animation: slideDown 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes slideDown {
+    from { opacity: 0; transform: translateY(-6px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+

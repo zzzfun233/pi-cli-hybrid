@@ -1,0 +1,6 @@
+{
+  "name": "智能 Web 助手",
+  "description": "一个功能强大的智能 Web 应用程序开发助手，能够根据您的需求快速构建、修改和优化项目。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

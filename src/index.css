@@ -1,0 +1,143 @@
+@import "tailwindcss";
+
+* { box-sizing: border-box; }
+
+/* Keep scrollbars slim and visible unless a component opts out. */
+* {
+    scrollbar-width: thin;
+    scrollbar-color: #d4d4d8 transparent;
+}
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+::-webkit-scrollbar-thumb {
+    background: #d4d4d8;
+    border: 2px solid transparent;
+    border-radius: 9999px;
+    background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: #a1a1aa;
+    border: 2px solid transparent;
+    background-clip: content-box;
+}
+
+.scrollbar-hidden {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+}
+.scrollbar-hidden::-webkit-scrollbar {
+    display: none;
+}
+
+.app-titlebar {
+    -webkit-app-region: drag;
+}
+.app-titlebar button,
+.app-titlebar input,
+.app-titlebar select,
+.app-titlebar textarea,
+.app-titlebar a,
+.app-titlebar [data-no-window-drag="true"] {
+    -webkit-app-region: no-drag;
+}
+
+body, html { 
+    height: 100%; 
+    background-color: #ffffff; 
+    color: #000000; 
+    overscroll-behavior-y: none; /* 防止手机端下拉刷新出现空白 */
+    -webkit-tap-highlight-color: transparent; /* 去除手机端点击高亮 */
+}
+
+input:focus { outline: none; }
+
+/* 适配 iPhone 底部安全区 */
+.pb-safe { padding-bottom: max(1rem, env(safe-area-inset-bottom)); }
+.pt-safe { padding-top: max(1rem, env(safe-area-inset-top)); }
+
+.msg-enter {
+    animation: fadeIn 0.4s ease-out forwards;
+}
+
+/* 正在输入动画的三个小点 */
+.typing-dot {
+    animation: blink 1.4s infinite both;
+    height: 4px;
+    width: 4px;
+    background: #d1d5db;
+    border-radius: 50%;
+    display: inline-block;
+    margin: 0 1px;
+}
+.typing-dot:nth-child(2) { animation-delay: 0.2s; }
+.typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes blink {
+    0% { opacity: 0.2; }
+    20% { opacity: 1; }
+    100% { opacity: 0.2; }
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(5px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+/* Settings panel animations */
+.settings-backdrop-enter {
+    animation: backdropIn 0.2s ease-out forwards;
+}
+.settings-panel-enter {
+    animation: panelIn 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes backdropIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+@keyframes panelIn {
+    from { opacity: 0; transform: scale(0.96) translateY(8px); }
+    to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+/* Popover menu animation */
+.animate-popover-in {
+    animation: popoverIn 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    transform-origin: bottom right;
+}
+
+@keyframes popoverIn {
+    from { opacity: 0; transform: scale(0.95) translateY(6px); }
+    to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+/* Custom mini scrollbar for models list */
+.custom-scrollbar::-webkit-scrollbar {
+    display: block !important;
+    width: 4px !important;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent !important;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+    background: #e4e4e7 !important;
+    border-radius: 9999px !important;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: #d4d4d8 !important;
+}
+
+/* Custom form animation */
+.animate-slideDown {
+    animation: slideDown 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes slideDown {
+    from { opacity: 0; transform: translateY(-6px); }
+    to { opacity: 1; transform: translateY(0); }
+}
