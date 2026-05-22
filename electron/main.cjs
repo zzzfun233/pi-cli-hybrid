@@ -743,10 +743,10 @@ ipcMain.handle('select-model', async (event, model) => {
 });
 
 ipcMain.handle('select-thinking-level', async (event, level) => {
-  const targetLevel = String(level || '').trim();
-  const levels = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
-  if (!levels.includes(targetLevel)) {
-    return { success: false, error: `Unknown thinking level: ${targetLevel}` };
+  const thinkingLevel = String(level || '').trim();
+  const allowedLevels = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh']);
+  if (!allowedLevels.has(thinkingLevel)) {
+    return { success: false, error: `Unknown thinking level: ${thinkingLevel}` };
   }
 
   const cwd = currentWorkspacePath || os.homedir();
@@ -754,18 +754,8 @@ ipcMain.handle('select-thinking-level', async (event, level) => {
     return { success: false, error: 'PTY is not running' };
   }
 
-  // Calculate how many Shift+Tab presses needed
-  const currentIdx = levels.indexOf(currentThinkingLevel || 'off');
-  const targetIdx = levels.indexOf(targetLevel);
-  let steps = (targetIdx - currentIdx + levels.length) % levels.length;
-
-  // Send Shift+Tab keybindings to cycle
-  const shiftTab = '\x1b[Z';
-  for (let i = 0; i < steps; i++) {
-    ptyProcess.write(shiftTab);
-  }
-
-  currentThinkingLevel = targetLevel;
+  writePromptToPty(`/thinking-level ${thinkingLevel}`);
+  currentThinkingLevel = thinkingLevel;
   return { success: true };
 });
 
