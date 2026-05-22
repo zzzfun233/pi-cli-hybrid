@@ -22,6 +22,7 @@ let sessionDirWatcher = null;
 let pendingSessionFile = null;
 let ptyStartSeq = 0;
 let sessionWatchTimer = null;
+let currentThinkingLevel = null; // Track current thinking level for cycling
 
 // ─── Fetch available models via CLI --list-models ────────────────
 function fetchAvailableModels() {
@@ -448,7 +449,10 @@ function watchSessionFile(filePath) {
   // Send initial model/thinking state from session
   const { model, thinkingLevel } = extractModelAndThinking(filePath);
   if (model) notifyRenderer('session-model-change', model);
-  if (thinkingLevel) notifyRenderer('session-thinking-level-change', { thinkingLevel });
+  if (thinkingLevel) {
+    currentThinkingLevel = thinkingLevel;
+    notifyRenderer('session-thinking-level-change', { thinkingLevel });
+  }
 
   // Watch for changes
   let lastSize = 0;
@@ -486,6 +490,7 @@ function watchSessionFile(filePath) {
             } else if (entry.type === 'model_change') {
               notifyRenderer('session-model-change', { id: entry.modelId, provider: entry.provider });
             } else if (entry.type === 'thinking_level_change') {
+              currentThinkingLevel = entry.thinkingLevel;
               notifyRenderer('session-thinking-level-change', { thinkingLevel: entry.thinkingLevel });
             }
           }
@@ -738,10 +743,10 @@ ipcMain.handle('select-model', async (event, model) => {
 });
 
 ipcMain.handle('select-thinking-level', async (event, level) => {
-  const thinkingLevel = String(level || '').trim();
-  const allowedLevels = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh']);
-  if (!allowedLevels.has(thinkingLevel)) {
-    return { success: false, error: `Unknown thinking level: ${thinkingLevel}` };
+  const targetLevel = String(level || '').trim();
+  const levels = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
+  if (!levels.includes(targetLevel)) {
+    return { success: false, error: `Unknown thinking level: ${targetLevel}` };
   }
 
   const cwd = currentWorkspacePath || os.homedir();
@@ -749,7 +754,18 @@ ipcMain.handle('select-thinking-level', async (event, level) => {
     return { success: false, error: 'PTY is not running' };
   }
 
-  writePromptToPty(`/thinking-level ${thinkingLevel}`);
+  // Calculate how many Shift+Tab presses needed
+  const currentIdx = levels.indexOf(currentThinkingLevel || 'off');
+  const targetIdx = levels.indexOf(targetLevel);
+  let steps = (targetIdx - currentIdx + levels.length) % levels.length;
+
+  // Send Shift+Tab keybindings to cycle
+  const shiftTab = '\x1b[Z';
+  for (let i = 0; i < steps; i++) {
+    ptyProcess.write(shiftTab);
+  }
+
+  currentThinkingLevel = targetLevel;
   return { success: true };
 });
 
