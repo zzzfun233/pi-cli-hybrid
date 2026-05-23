@@ -435,6 +435,9 @@ function watchSessionFile(filePath) {
   if (currentSessionFile && path.resolve(currentSessionFile) === filePath) return;
   stopSessionFileWatcher();
 
+  optimisticThinkingLevel = null;
+  thinkingLevelLockUntil = 0;
+
   currentSessionFile = filePath;
   console.log(`[Session Watcher] Watching: ${filePath}`);
 
@@ -451,10 +454,9 @@ function watchSessionFile(filePath) {
   // Send initial model/thinking state from session
   const { model, thinkingLevel } = extractModelAndThinking(filePath);
   if (model) notifyRenderer('session-model-change', model);
-  if (thinkingLevel) {
-    currentThinkingLevel = thinkingLevel;
-    notifyRenderer('session-thinking-level-change', { thinkingLevel });
-  }
+  
+  currentThinkingLevel = thinkingLevel || 'medium'; // pi-agent defaults to medium
+  notifyRenderer('session-thinking-level-change', { thinkingLevel: currentThinkingLevel });
 
   // Watch for changes
   let lastSize = 0;
@@ -501,6 +503,8 @@ function watchSessionFile(filePath) {
         } else if (stat.size < lastSize) {
           // File was truncated (new session), re-read everything
           lastSize = stat.size;
+          optimisticThinkingLevel = null;
+          thinkingLevelLockUntil = 0;
           const messages = extractMessagesFromSession(filePath);
           const meta = readSessionMeta(filePath);
           notifyRenderer('session-messages', {
@@ -509,6 +513,11 @@ function watchSessionFile(filePath) {
             meta,
             messages
           });
+          
+          const { model, thinkingLevel } = extractModelAndThinking(filePath);
+          if (model) notifyRenderer('session-model-change', model);
+          currentThinkingLevel = thinkingLevel || 'medium';
+          notifyRenderer('session-thinking-level-change', { thinkingLevel: currentThinkingLevel });
         }
       } catch (err) {
         console.error('[Session Watcher] Error reading session file:', err.message);
