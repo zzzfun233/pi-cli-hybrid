@@ -743,10 +743,10 @@ ipcMain.handle('select-model', async (event, model) => {
 });
 
 ipcMain.handle('select-thinking-level', async (event, level) => {
-  const thinkingLevel = String(level || '').trim();
-  const allowedLevels = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh']);
-  if (!allowedLevels.has(thinkingLevel)) {
-    return { success: false, error: `Unknown thinking level: ${thinkingLevel}` };
+  const targetLevel = String(level || '').trim();
+  const levels = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
+  if (!levels.includes(targetLevel)) {
+    return { success: false, error: `Unknown thinking level: ${targetLevel}` };
   }
 
   const cwd = currentWorkspacePath || os.homedir();
@@ -754,8 +754,17 @@ ipcMain.handle('select-thinking-level', async (event, level) => {
     return { success: false, error: 'PTY is not running' };
   }
 
-  writePromptToPty(`/thinking-level ${thinkingLevel}`);
-  currentThinkingLevel = thinkingLevel;
+  // Use Shift+Tab cycling to reach target level
+  const currentIdx = levels.indexOf(currentThinkingLevel || 'off');
+  const targetIdx = levels.indexOf(targetLevel);
+  let steps = (targetIdx - currentIdx + levels.length) % levels.length;
+
+  const shiftTab = '\x1b[Z';
+  for (let i = 0; i < steps; i++) {
+    ptyProcess.write(shiftTab);
+  }
+
+  currentThinkingLevel = targetLevel;
   return { success: true };
 });
 
