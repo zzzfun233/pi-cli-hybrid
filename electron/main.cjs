@@ -23,6 +23,7 @@ let pendingSessionFile = null;
 let ptyStartSeq = 0;
 let sessionWatchTimer = null;
 let currentThinkingLevel = null; // Track current thinking level for cycling
+let optimisticThinkingLevel = null; // Track expected level during rapid UI clicks
 let thinkingLevelLockUntil = 0; // Lock for thinking level UI updates
 
 // ─── Fetch available models via CLI --list-models ────────────────
@@ -757,14 +758,15 @@ ipcMain.handle('select-thinking-level', async (event, level) => {
     return { success: false, error: 'PTY is not running' };
   }
 
-  // Use Shift+Tab cycling to reach target level
-  const currentIdx = levels.indexOf(currentThinkingLevel || 'off');
+  // Use optimistic level if we are currently locked (rapid clicking)
+  const baseLevel = (Date.now() < thinkingLevelLockUntil ? optimisticThinkingLevel : currentThinkingLevel) || 'off';
+  const currentIdx = levels.indexOf(baseLevel);
   const targetIdx = levels.indexOf(targetLevel);
   let steps = (targetIdx - currentIdx + levels.length) % levels.length;
 
   if (steps > 0) {
-    thinkingLevelLockUntil = Date.now() + 1000; // Lock UI updates for 1 second
-    currentThinkingLevel = targetLevel; // Optimistically update
+    thinkingLevelLockUntil = Date.now() + 1500; // Lock UI updates for 1.5 seconds
+    optimisticThinkingLevel = targetLevel; // Optimistically update expected state
 
     const shiftTab = '\x1b[Z';
     // Send keystrokes with slight delay to prevent TUI buffer overflow
