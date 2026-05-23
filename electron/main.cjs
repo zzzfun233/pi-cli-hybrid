@@ -23,6 +23,7 @@ let pendingSessionFile = null;
 let ptyStartSeq = 0;
 let sessionWatchTimer = null;
 let currentThinkingLevel = null; // Track current thinking level for cycling
+let thinkingLevelLockUntil = 0; // Lock for thinking level UI updates
 
 // ─── Fetch available models via CLI --list-models ────────────────
 function fetchAvailableModels() {
@@ -491,7 +492,9 @@ function watchSessionFile(filePath) {
               notifyRenderer('session-model-change', { id: entry.modelId, provider: entry.provider });
             } else if (entry.type === 'thinking_level_change') {
               currentThinkingLevel = entry.thinkingLevel;
-              notifyRenderer('session-thinking-level-change', { thinkingLevel: entry.thinkingLevel });
+              if (Date.now() > thinkingLevelLockUntil) {
+                notifyRenderer('session-thinking-level-change', { thinkingLevel: entry.thinkingLevel });
+              }
             }
           }
         } else if (stat.size < lastSize) {
@@ -759,12 +762,23 @@ ipcMain.handle('select-thinking-level', async (event, level) => {
   const targetIdx = levels.indexOf(targetLevel);
   let steps = (targetIdx - currentIdx + levels.length) % levels.length;
 
-  const shiftTab = '\x1b[Z';
-  for (let i = 0; i < steps; i++) {
-    ptyProcess.write(shiftTab);
+  if (steps > 0) {
+    thinkingLevelLockUntil = Date.now() + 1000; // Lock UI updates for 1 second
+    currentThinkingLevel = targetLevel; // Optimistically update
+
+    const shiftTab = '\x1b[Z';
+    // Send keystrokes with slight delay to prevent TUI buffer overflow
+    const sendSteps = async () => {
+      for (let i = 0; i < steps; i++) {
+        if (ptyProcess) {
+          ptyProcess.write(shiftTab);
+        }
+        await new Promise(r => setTimeout(r, 15));
+      }
+    };
+    sendSteps().catch(err => console.error('Error sending shift+tab:', err));
   }
 
-  currentThinkingLevel = targetLevel;
   return { success: true };
 });
 
