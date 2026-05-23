@@ -13,8 +13,7 @@ export default function XtermTerminal({ visible }: XtermTerminalProps) {
   const fitAddonRef = useRef<FitAddon | null>(null);
   const cleanupRef = useRef<(() => void)[]>([]);
   const visibleRef = useRef(visible);
-
-
+  const hiddenOutputSeenRef = useRef(false);
   useEffect(() => {
     visibleRef.current = visible;
   }, [visible]);
@@ -92,6 +91,10 @@ export default function XtermTerminal({ visible }: XtermTerminalProps) {
     // Connect PTY output -> terminal
     if (api?.onPtyData) {
       const unsub = api.onPtyData((data: string) => {
+        if (!visibleRef.current) {
+          hiddenOutputSeenRef.current = true;
+          return;
+        }
         terminal.write(data);
       });
       cleanupRef.current.push(unsub);
@@ -132,6 +135,7 @@ export default function XtermTerminal({ visible }: XtermTerminalProps) {
 
     if (api?.onPtyReset) {
       const unsub = api.onPtyReset(() => {
+        hiddenOutputSeenRef.current = false;
         terminal.clear();
         terminal.reset();
       });
@@ -163,6 +167,24 @@ export default function XtermTerminal({ visible }: XtermTerminalProps) {
   // Fit when visibility changes
   useEffect(() => {
     if (!visible || !fitAddonRef.current || !terminalRef.current) return;
+    const terminal = terminalRef.current;
+    
+    if (hiddenOutputSeenRef.current) {
+      terminal.clear();
+      terminal.reset();
+      hiddenOutputSeenRef.current = false;
+      
+      // Force a redraw by temporarily shrinking and restoring the PTY size
+      const api = (window as any).api;
+      if (api?.ptyResize) {
+        api.ptyResize(terminal.cols, terminal.rows - 1);
+        setTimeout(() => {
+          if (visibleRef.current) {
+            api.ptyResize(terminal.cols, terminal.rows);
+          }
+        }, 50);
+      }
+    }
     focusTerminal();
   }, [focusTerminal, visible]);
 
