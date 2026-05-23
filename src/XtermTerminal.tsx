@@ -13,7 +13,7 @@ export default function XtermTerminal({ visible }: XtermTerminalProps) {
   const fitAddonRef = useRef<FitAddon | null>(null);
   const cleanupRef = useRef<(() => void)[]>([]);
   const visibleRef = useRef(visible);
-  const hiddenOutputSeenRef = useRef(false);
+
 
   useEffect(() => {
     visibleRef.current = visible;
@@ -92,10 +92,6 @@ export default function XtermTerminal({ visible }: XtermTerminalProps) {
     // Connect PTY output -> terminal
     if (api?.onPtyData) {
       const unsub = api.onPtyData((data: string) => {
-        if (!visibleRef.current) {
-          hiddenOutputSeenRef.current = true;
-          return;
-        }
         terminal.write(data);
       });
       cleanupRef.current.push(unsub);
@@ -136,7 +132,6 @@ export default function XtermTerminal({ visible }: XtermTerminalProps) {
 
     if (api?.onPtyReset) {
       const unsub = api.onPtyReset(() => {
-        hiddenOutputSeenRef.current = false;
         terminal.clear();
         terminal.reset();
       });
@@ -168,11 +163,6 @@ export default function XtermTerminal({ visible }: XtermTerminalProps) {
   // Fit when visibility changes
   useEffect(() => {
     if (!visible || !fitAddonRef.current || !terminalRef.current) return;
-    if (hiddenOutputSeenRef.current) {
-      terminalRef.current.clear();
-      terminalRef.current.reset();
-      hiddenOutputSeenRef.current = false;
-    }
     focusTerminal();
   }, [focusTerminal, visible]);
 
