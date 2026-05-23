@@ -31,6 +31,16 @@
 
 ---
 
+## ⚔️ 生态站位：为什么选择 Blank AI？
+
+当前的 AI Agent 生态圈可谓神仙打架，但在面对如 OpenAI Codex CLI、Google Antigravity 等顶流竞品时，本项目凭借极简的架构与克制的设计，打出了独属于自己的生态位：
+
+* ☯️ **双模无缝切换 (Dual-Mode)**：打破传统 Agent "纯 CLI 太乱，纯 GUI 太封闭"的困局。本客户端实现了前端 GUI 界面与 PTY 真实终端环境的 100% 双向同步切换。点击切换按钮，瞬间在原汁原味的极客字符界面与渲染精美的 Markdown 视图间无缝穿梭。
+* ✨ **优雅的内省展示 (Elegant Introspection)**：大模型调用底层工具（Tool Use）和思维链（Thinking Process）的过程往往伴随大量刷屏。我们通过自研的 UI 将这些中间过程以灰色斜体及折叠面板优雅收纳——既保持了极客所需的底层透明度，又保证了对话界面的绝对清爽。
+* 🪶 **轻量化降维打击**：相较于越做越重、强迫用户改变工作流的 IDE 级应用（如 Cursor 或全套的 Antigravity），本项目坚持做一个轻量、纯粹的桌面端 Wrapper。让你既能享受现代 GUI 的直观美学，又能随时退回 Terminal 掌控一切。
+
+---
+
 ## 🛠️ 技术栈总览
 
 | 技术层 | 选型组件 | 说明 |
@@ -104,6 +114,26 @@ PyriteLab/
 ---
 
 ## 🚀 开发者快速起步
+
+### 0. 前置依赖：安装 pi CLI
+
+PyriteLab 是 [pi](https://pi.dev) 的桌面 GUI 客户端，**必须依赖本地安装的 pi CLI 才能运行**。App 启动后会通过 PTY（伪终端）自动调用 pi CLI 执行 AI Agent 的所有核心能力（对话、工具调用、Session 管理等）。
+
+**安装方式：**
+```powershell
+# 全局安装 pi CLI
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+```
+
+> `--ignore-scripts` 禁用依赖生命周期脚本，pi 正常使用不需要 install scripts。详见 [pi Quick Start](https://github.com/earendil-works/pi-coding-agent#quick-start)。
+
+**配置 CLI 路径：**
+默认情况下，App 会尝试从 `D:/pi-agent/packages/coding-agent/dist/cli.js` 加载 CLI。如果你的安装路径不同，请在 `.env` 中设置：
+```env
+PI_AGENT_CLI_PATH="/your/path/to/pi-coding-agent/dist/cli.js"
+```
+
+> ⚠️ 如果 pi CLI 未安装或路径配置错误，App 启动后会显示 `Pi Agent CLI not found` 错误，聊天和终端功能将无法使用。
 
 ### 1. 准备工作
 确保本地已安装 [Node.js (LTS v18 或更高版本)](https://nodejs.org/)。
