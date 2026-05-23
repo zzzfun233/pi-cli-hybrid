@@ -408,6 +408,20 @@ export default function App() {
     return () => cleanups.forEach(fn => fn());
   }, []);
 
+  useEffect(() => {
+    const fetchThinking = async () => {
+      const chat = savedChats.find(c => c.id === currentSessionId);
+      if (chat?.sessionPath) {
+        const api = (window as any).api;
+        if (api?.getSessionThinkingLevel) {
+          const level = await api.getSessionThinkingLevel(chat.sessionPath);
+          if (level) setThinkingLevel(level);
+        }
+      }
+    };
+    fetchThinking();
+  }, [currentSessionId, savedChats]);
+
   // Close model dropdown when clicking outside
   useEffect(() => {
     if (!isModelDropdownOpen) return;
@@ -523,12 +537,12 @@ export default function App() {
     return value ? value.replace(/\\/g, '/').toLowerCase() : '';
   };
 
-  const ensurePtyMatchesCurrentChat = async () => {
+  const ensurePtyMatchesCurrentChat = async (draftChat?: ChatSession) => {
     const api = (window as any).api;
     if (!api) return;
 
     const activeId = currentSessionIdRef.current;
-    const chat = activeId ? savedChats.find(c => c.id === activeId) : null;
+    const chat = draftChat || (activeId ? savedChats.find(c => c.id === activeId) : null);
 
     if (chat && isDraftSessionId(chat.id)) {
       if (api.newSession) {
@@ -655,6 +669,10 @@ export default function App() {
       }
     } else if (!workspacePath) {
       setCurrentWorkspace(null);
+    }
+    // Reset terminal if currently in terminal mode
+    if (showTerminalMode) {
+      await ensurePtyMatchesCurrentChat(draftChat);
     }
     setTimeout(() => {
       inputRef.current?.focus();
@@ -859,7 +877,7 @@ export default function App() {
         });
 
         const lastMsg = convertedMessages[convertedMessages.length - 1];
-        const isFinished = !lastMsg || (lastMsg.sender === 'ai' && !lastMsg.isHistoryOpen);
+        const isFinished = !lastMsg || (lastMsg.sender === 'ai' && (!lastMsg.history || lastMsg.history.length === 0));
         setIsTyping(!isFinished && convertedMessages.length > 0);
       });
       cleanups.push(unsub);
@@ -1032,6 +1050,20 @@ export default function App() {
 
     return () => cleanups.forEach(fn => fn());
   }, []);
+
+  useEffect(() => {
+    const fetchThinking = async () => {
+      const chat = savedChats.find(c => c.id === currentSessionId);
+      if (chat?.sessionPath) {
+        const api = (window as any).api;
+        if (api?.getSessionThinkingLevel) {
+          const level = await api.getSessionThinkingLevel(chat.sessionPath);
+          if (level) setThinkingLevel(level);
+        }
+      }
+    };
+    fetchThinking();
+  }, [currentSessionId, savedChats]);
 
   const handlePaste = (e: React.ClipboardEvent) => {
     const items = e.clipboardData?.items;

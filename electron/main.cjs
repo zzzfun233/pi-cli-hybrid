@@ -767,39 +767,62 @@ ipcMain.handle('select-thinking-level', async (event, level) => {
     return { success: false, error: 'PTY is not running' };
   }
 
-  // Use optimistic level if we are currently locked (rapid clicking)
-  const baseLevel = (Date.now() < thinkingLevelLockUntil ? optimisticThinkingLevel : currentThinkingLevel) || 'off';
-  const currentIdx = levels.indexOf(baseLevel);
-  const targetIdx = levels.indexOf(targetLevel);
-  let steps = (targetIdx - currentIdx + levels.length) % levels.length;
+  if (currentThinkingLevel === targetLevel) return { success: true };
 
-  if (steps > 0) {
-    thinkingLevelLockUntil = Date.now() + 1500; // Lock UI updates for 1.5 seconds
-    optimisticThinkingLevel = targetLevel; // Optimistically update expected state
+  thinkingLevelLockUntil = Date.now() + 5000; // Lock UI updates
+  optimisticThinkingLevel = targetLevel;
 
-    const shiftTab = '\x1b[Z';
-    // Send keystrokes with slight delay to prevent TUI buffer overflow
-    const sendSteps = async () => {
-      for (let i = 0; i < steps; i++) {
-        if (ptyProcess) {
-          ptyProcess.write(shiftTab);
-        }
-        await new Promise(r => setTimeout(r, 15));
+  const shiftTab = '\x1b[Z';
+  const startLevel = currentThinkingLevel;
+  
+  const cycleAndCheck = async () => {
+    let cycles = 0;
+    while (cycles < 7) {
+      const prevLevel = currentThinkingLevel;
+      if (ptyProcess) {
+        ptyProcess.write(shiftTab);
       }
-    };
-    sendSteps().catch(err => console.error('Error sending shift+tab:', err));
-  }
+      cycles++;
+      
+      // Wait for currentThinkingLevel to change via file watcher
+      let waited = 0;
+      while (currentThinkingLevel === prevLevel && waited < 400) {
+        await new Promise(r => setTimeout(r, 10));
+        waited += 10;
+      }
+      
+      if (currentThinkingLevel === targetLevel) {
+        break; // Found it!
+      }
+      
+      // If we did a full circle back to start, the target is not supported
+      if (currentThinkingLevel === startLevel) {
+        // We should ideally restore the original level if we didn't find the target,
+        // but since we are at startLevel, we already restored it!
+        break;
+      }
+    }
+  };
+  
+  cycleAndCheck().catch(err => console.error('Error sending shift+tab:', err));
+
 
   return { success: true };
 });
 
-// Get session messages (for initial load)
 ipcMain.handle('get-session-messages', async () => {
   if (currentSessionFile && fs.existsSync(currentSessionFile)) {
     return extractMessagesFromSession(currentSessionFile);
   }
   return [];
 });
+
+ipcMain.handle('get-session-thinking-level', async (event, sessionPath) => {
+  if (!sessionPath || !fs.existsSync(sessionPath)) return 'medium';
+  const { thinkingLevel } = extractModelAndThinking(sessionPath);
+  return thinkingLevel || 'medium';
+});
+
 
 ipcMain.handle('list-sessions', async () => {
   return listSessionMetas();

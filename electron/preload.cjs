@@ -23,6 +23,7 @@ contextBridge.exposeInMainWorld('api', {
   // ─── Chat / Prompts ────────────────────────────────────
   sendPrompt: (text) => ipcRenderer.invoke('send-prompt', text),
   getSessionMessages: () => ipcRenderer.invoke('get-session-messages'),
+  getSessionThinkingLevel: (sessionPath) => ipcRenderer.invoke('get-session-thinking-level', sessionPath),
   listSessions: () => ipcRenderer.invoke('list-sessions'),
   openSession: (sessionPath) => ipcRenderer.invoke('open-session', sessionPath),
   deleteSession: (sessionPath) => ipcRenderer.invoke('delete-session', sessionPath),

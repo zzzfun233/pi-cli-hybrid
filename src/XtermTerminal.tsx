@@ -21,18 +21,26 @@ export default function XtermTerminal({ visible }: XtermTerminalProps) {
   const focusTerminal = useCallback(() => {
     const terminal = terminalRef.current;
     const fitAddon = fitAddonRef.current;
-    if (!terminal || !fitAddon) return;
+    const container = containerRef.current;
+    if (!terminal || !fitAddon || !container) return;
 
-    requestAnimationFrame(() => {
+    // Use a slight delay instead of just requestAnimationFrame to ensure
+    // layout is fully resolved after display:none is removed
+    setTimeout(() => {
+      // Never resize or fit if the container has no dimensions (e.g. hidden)
+      if (container.clientWidth === 0 || container.clientHeight === 0) return;
+      
       try {
         fitAddon.fit();
         const api = (window as any).api;
         if (api?.ptyResize) {
           api.ptyResize(terminal.cols, terminal.rows);
         }
-        terminal.focus();
+        if (visibleRef.current) {
+          terminal.focus();
+        }
       } catch {}
-    });
+    }, 50);
   }, []);
 
   // Initialize terminal when first shown (not in display:none)
@@ -91,16 +99,13 @@ export default function XtermTerminal({ visible }: XtermTerminalProps) {
     // Connect PTY output -> terminal
     if (api?.onPtyData) {
       const unsub = api.onPtyData((data: string) => {
-        if (!visibleRef.current) {
-          hiddenOutputSeenRef.current = true;
-          return;
-        }
         terminal.write(data);
       });
       cleanupRef.current.push(unsub);
     }
 
     const refreshTerminalLayout = () => {
+      if (containerRef.current?.clientWidth === 0 || containerRef.current?.clientHeight === 0) return;
       try {
         fitAddon.fit();
         terminal.refresh(0, terminal.rows - 1);
@@ -167,24 +172,6 @@ export default function XtermTerminal({ visible }: XtermTerminalProps) {
   // Fit when visibility changes
   useEffect(() => {
     if (!visible || !fitAddonRef.current || !terminalRef.current) return;
-    const terminal = terminalRef.current;
-    
-    if (hiddenOutputSeenRef.current) {
-      terminal.clear();
-      terminal.reset();
-      hiddenOutputSeenRef.current = false;
-      
-      // Force a redraw by temporarily shrinking and restoring the PTY size
-      const api = (window as any).api;
-      if (api?.ptyResize) {
-        api.ptyResize(terminal.cols, terminal.rows - 1);
-        setTimeout(() => {
-          if (visibleRef.current) {
-            api.ptyResize(terminal.cols, terminal.rows);
-          }
-        }, 50);
-      }
-    }
     focusTerminal();
   }, [focusTerminal, visible]);
 
