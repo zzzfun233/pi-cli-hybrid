@@ -238,6 +238,10 @@ export default function SettingsPanel({ isOpen, onClose }: SettingsPanelProps) {
     window.dispatchEvent(new CustomEvent('blankAI-settings-change', {
       detail: { key: 'blankAI_systemTools', value: systemTools }
     }));
+    const api = (window as any).api;
+    if (api && api.syncTools) {
+      api.syncTools(systemTools).catch((err: any) => console.error('[Sync Tools]', err));
+    }
   }, [systemTools]);
   useEffect(() => { localStorage.setItem('blankAI_mcpServers', JSON.stringify(mcpServers)); }, [mcpServers]);
   useEffect(() => { localStorage.setItem('blankAI_providers', JSON.stringify(providers)); }, [providers]);
@@ -836,7 +840,7 @@ function SystemToolsTab({
               </div>
             </div>
             <div className="flex items-center ml-4 shrink-0">
-              <Toggle on={p.enabled} onToggle={() => togglePlugin(p.id)} />
+              <Toggle on={p.enabled} onToggle={() => toggleTool(p.id)} />
             </div>
           </div>
         ))}

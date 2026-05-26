@@ -14,6 +14,8 @@ export default function XtermTerminal({ visible }: XtermTerminalProps) {
   const cleanupRef = useRef<(() => void)[]>([]);
   const visibleRef = useRef(visible);
   const hiddenOutputSeenRef = useRef(false);
+  const restartAttemptsRef = useRef(0);
+  const restartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     visibleRef.current = visible;
   }, [visible]);
@@ -133,7 +135,17 @@ export default function XtermTerminal({ visible }: XtermTerminalProps) {
       const unsub = api.onPtyExit(({ code }: { code: number }) => {
         terminal.writeln('');
         terminal.writeln(`\x1b[33m[Process exited with code ${code}]\x1b[0m`);
-        terminal.writeln('\x1b[90mPress any key or send a message to restart...\x1b[0m');
+        // Auto-restart only on crash (non-zero exit), with backoff (max 3 attempts)
+        if (code !== 0 && restartAttemptsRef.current < 3 && api?.startPty) {
+          restartAttemptsRef.current += 1;
+          const delay = Math.min(1000 * restartAttemptsRef.current, 3000);
+          terminal.writeln(`\x1b[90mAuto-restarting in ${delay / 1000}s (attempt ${restartAttemptsRef.current}/3)...\x1b[0m`);
+          restartTimerRef.current = setTimeout(() => {
+            api.startPty().catch(() => {});
+          }, delay);
+        } else {
+          terminal.writeln('\x1b[90mPress any key or send a message to restart...\x1b[0m');
+        }
       });
       cleanupRef.current.push(unsub);
     }
@@ -141,6 +153,7 @@ export default function XtermTerminal({ visible }: XtermTerminalProps) {
     if (api?.onPtyReset) {
       const unsub = api.onPtyReset(() => {
         hiddenOutputSeenRef.current = false;
+        restartAttemptsRef.current = 0;
         terminal.clear();
         terminal.reset();
       });
@@ -159,6 +172,10 @@ export default function XtermTerminal({ visible }: XtermTerminalProps) {
   // Cleanup only on unmount (not when visible toggles)
   useEffect(() => {
     return () => {
+      if (restartTimerRef.current) {
+        clearTimeout(restartTimerRef.current);
+        restartTimerRef.current = null;
+      }
       cleanupRef.current.forEach(fn => fn());
       cleanupRef.current = [];
       if (terminalRef.current) {

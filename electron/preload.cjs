@@ -84,6 +84,12 @@ contextBridge.exposeInMainWorld('api', {
   // ─── Skills ────────────────────────────────────────────
   syncSkills: (skills) => ipcRenderer.invoke('sync-skills', skills),
 
+  // ─── System Prompt ─────────────────────────────────────
+  syncSystemPrompt: (prompt) => ipcRenderer.invoke('sync-system-prompt', prompt),
+
+  // ─── System Tools ──────────────────────────────────────
+  syncTools: (tools) => ipcRenderer.invoke('sync-system-tools', tools),
+
   // ─── Error channel ─────────────────────────────────────
   onPiAgentError: (callback) => {
     const subscription = (event, data) => callback(data);

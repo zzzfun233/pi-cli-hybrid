@@ -1,5 +1,7 @@
 @import "tailwindcss";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
 * { box-sizing: border-box; }
 
 /* Keep scrollbars slim and visible unless a component opts out. */
@@ -140,4 +142,62 @@ input:focus { outline: none; }
 @keyframes slideDown {
     from { opacity: 0; transform: translateY(-6px); }
     to { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Dark Mode ─────────────────────────────────────── */
+.dark body, .dark html {
+    background-color: #0d0d0d;
+    color: #e4e4e7;
+}
+.dark .bg-white {
+    background-color: #0d0d0d;
+}
+.dark .from-white {
+    --tw-gradient-from: #0d0d0d;
+    --tw-gradient-to: transparent;
+}
+.dark .via-white\/95 {
+    --tw-gradient-via: oklch(0% 0 0 / 0.95);
+}
+.dark .to-transparent {
+    --tw-gradient-to: transparent;
+}
+.dark .text-black {
+    color: #e4e4e7;
+}
+.dark .text-gray-800 {
+    color: #d4d4d8;
+}
+.dark .text-gray-900 {
+    color: #e4e4e7;
+}
+.dark .text-gray-700 {
+    color: #a1a1aa;
+}
+.dark .bg-gray-100 {
+    background-color: #1c1c1e;
+}
+.dark .bg-gray-50\/40 {
+    background-color: oklch(0.15 0 0 / 0.4);
+}
+.dark .bg-gray-50\/80 {
+    background-color: oklch(0.15 0 0 / 0.8);
+}
+.dark .bg-gray-50\/50 {
+    background-color: oklch(0.15 0 0 / 0.5);
+}
+.dark .border-gray-200 {
+    border-color: #2c2c2e;
+}
+.dark .border-gray-100 {
+    border-color: #1c1c1e;
+}
+.dark .bg-\[\#fcfcfd\] {
+    background-color: #111113;
+}
+.dark .bg-gray-100\/80 {
+    background-color: oklch(0.2 0 0 / 0.8);
+}
+.dark input.bg-transparent {
+    color: #e4e4e7;
 }

@@ -44,7 +44,7 @@ export function SkillList({ skills, setSkills, onEdit, onAdd, onDelete }: {
         <h3 className="text-[13px] text-gray-400 uppercase tracking-wider select-none">Skills</h3>
         <div className="flex items-center gap-2">
           <input type="file" multiple accept=".txt,.md,text/*" className="hidden" ref={fileInputRef} onChange={e => handleImport(e, false)} />
-          <input type="file" webkitdirectory="true" directory="true" className="hidden" ref={folderInputRef} onChange={e => handleImport(e, true)} />
+          <input type="file" className="hidden" ref={folderInputRef} onChange={e => handleImport(e, true)} {...{webkitdirectory: 'true', directory: 'true'} as any} />
           <button onClick={() => fileInputRef.current?.click()} className="p-1.5 text-gray-400 hover:text-gray-900 bg-gray-50 hover:bg-gray-100 rounded-lg transition-all" title="Import Files">
             <FileUp size={16} />
           </button>

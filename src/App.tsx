@@ -314,9 +314,11 @@ export default function App() {
   const chatAreaRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const formRef = useRef<HTMLFormElement>(null);
   const currentSessionIdRef = useRef<string | null>(null);
   const activeAgentSessionIdRef = useRef<string | null>(null);
   const pendingDraftSessionIdRef = useRef<string | null>(null);
+  const isSendingRef = useRef<boolean>(false);
   const currentWorkspaceRef = useRef<WorkspaceInfo | null>(currentWorkspace);
   const processedEntryIdsRef = useRef<Set<string>>(new Set());
   // Tracks whether the user has explicitly navigated — blocks backend pushes from hijacking the view
@@ -340,6 +342,27 @@ export default function App() {
       console.error('Failed to persist current workspace:', e);
     }
   }, [currentWorkspace]);
+
+  // Apply dark mode theme class on <html>
+  useEffect(() => {
+    const applyTheme = () => {
+      try {
+        const theme = JSON.parse(localStorage.getItem('blankAI_theme') || '"light"');
+        const isDark = theme === 'dark' || (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        document.documentElement.classList.toggle('dark', isDark);
+      } catch {}
+    };
+    applyTheme();
+    const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+    const onSystemChange = () => applyTheme();
+    mediaQuery.addEventListener('change', onSystemChange);
+    window.addEventListener('storage', (e) => {
+      if (e.key === 'blankAI_theme') applyTheme();
+    });
+    return () => {
+      mediaQuery.removeEventListener('change', onSystemChange);
+    };
+  }, []);
 
   // Restore workspace and listen for PTY session state on mount
   useEffect(() => {
@@ -781,14 +804,14 @@ export default function App() {
           if (msg.role === 'user') {
             const display = parseUserMessageForDisplay(msg.text);
             convertedMessages.push({
-              id: `session-user-${msg.timestamp}`,
+              id: `session-user-${msg.id || msg.timestamp}`,
               text: display.text,
               sender: 'user',
               attachment: display.attachment
             });
           } else if (msg.role === 'assistant') {
             convertedMessages.push({
-              id: `session-ai-${msg.timestamp}`,
+              id: `session-ai-${msg.id || msg.timestamp}`,
               text: msg.text,
               thinking: msg.thinking || '',
               sender: 'ai',
@@ -862,9 +885,15 @@ export default function App() {
           };
 
           if (existing) {
+            // Preserve optimistic local messages not yet confirmed by the backend
+            const convertedUserTexts = new Set(convertedMessages.filter(m => m.sender === 'user').map(m => m.text));
+            const pendingLocalMessages = existing.messages.filter(
+              m => m.sender === 'user' && m.id?.startsWith('local-user-') && !convertedUserTexts.has(m.text)
+            );
+            const mergedMessages = [...pendingLocalMessages, ...convertedMessages];
             return prevChats
               .filter(c => c.id !== draftId || c.id === cliSessionId)
-              .map(c => c.id === cliSessionId ? { ...c, ...nextChat } : c);
+              .map(c => c.id === cliSessionId ? { ...c, ...nextChat, messages: mergedMessages } : c);
           }
 
           if (draftIndex >= 0) {
@@ -1051,20 +1080,6 @@ export default function App() {
     return () => cleanups.forEach(fn => fn());
   }, []);
 
-  useEffect(() => {
-    const fetchThinking = async () => {
-      const chat = savedChats.find(c => c.id === currentSessionId);
-      if (chat?.sessionPath) {
-        const api = (window as any).api;
-        if (api?.getSessionThinkingLevel) {
-          const level = await api.getSessionThinkingLevel(chat.sessionPath);
-          if (level) setThinkingLevel(level);
-        }
-      }
-    };
-    fetchThinking();
-  }, [currentSessionId, savedChats]);
-
   const handlePaste = (e: React.ClipboardEvent) => {
     const items = e.clipboardData?.items;
     if (items) {
@@ -1083,9 +1098,11 @@ export default function App() {
 
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSendingRef.current) return;
     const text = inputText.trim();
     if (!text && !selectedFile) return;
 
+    isSendingRef.current = true;
     const fileToUpload = selectedFile;
     const activeSessionId = currentSessionIdRef.current;
 
@@ -1183,20 +1200,24 @@ export default function App() {
     }
 
     const api = (window as any).api;
-    if (api && api.sendPrompt) {
-      await ensurePtyMatchesCurrentChat();
-      const result = await api.sendPrompt(finalPrompt);
-      if (!result?.success) {
+    try {
+      if (api && api.sendPrompt) {
+        await ensurePtyMatchesCurrentChat();
+        const result = await api.sendPrompt(finalPrompt);
+        if (!result?.success) {
+          setIsTyping(false);
+          setSavedChats(prevChats => prevChats.map(chat =>
+            chat.id === currentSessionIdRef.current
+              ? { ...chat, messages: [...chat.messages, { id: `send-error-${Date.now()}`, text: `[Error]: ${result?.error || 'PTY is not running'}`, sender: 'ai' }] }
+              : chat
+          ));
+        }
+      } else {
+        console.warn("Electron API not available");
         setIsTyping(false);
-        setSavedChats(prevChats => prevChats.map(chat =>
-          chat.id === currentSessionIdRef.current
-            ? { ...chat, messages: [...chat.messages, { id: `send-error-${Date.now()}`, text: `[Error]: ${result?.error || 'PTY is not running'}`, sender: 'ai' }] }
-            : chat
-        ));
       }
-    } else {
-      console.warn("Electron API not available");
-      setIsTyping(false);
+    } finally {
+      isSendingRef.current = false;
     }
   };
 
@@ -1351,7 +1372,7 @@ export default function App() {
 
         {/* Input Area */}
         <div className="absolute bottom-0 left-0 w-full flex justify-center bg-gradient-to-t from-white via-white/95 to-transparent pb-6 pt-12 z-20 pointer-events-none">
-          <form onSubmit={handleSend} className="w-full max-w-[752px] px-6 pb-2 flex flex-col gap-3 relative pointer-events-auto">
+          <form ref={formRef} onSubmit={handleSend} className="w-full max-w-[752px] px-6 pb-2 flex flex-col gap-3 relative pointer-events-auto">
               {isTyping && (
                   <div className="flex justify-center w-full mb-0 -mt-8">
                       <button
@@ -1427,12 +1448,15 @@ export default function App() {
                           })();
                           if (e.key === 'Enter') {
                               if (sendShortcut === 'ctrl-enter') {
-                                  if (!e.ctrlKey && !e.metaKey) {
-                                      e.preventDefault(); // Stop standard enter submission
+                                  if (e.ctrlKey || e.metaKey) {
+                                      e.preventDefault();
+                                      formRef.current?.requestSubmit();
+                                  } else {
+                                      e.preventDefault();
                                   }
                               } else {
                                   if (e.ctrlKey || e.metaKey || e.shiftKey) {
-                                      // Allow modifier operations
+                                      return;
                                   }
                               }
                           }
