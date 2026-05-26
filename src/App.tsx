@@ -1,187 +1,44 @@
 import React, { Suspense, lazy, useState, useEffect, useRef, useCallback } from 'react';
 import { X, Plus, ArrowUp, PanelLeft, Terminal, ChevronDown, ChevronLeft, ChevronRight, Clipboard, Scissors, Copy, MousePointer2, FolderOpen, Square } from 'lucide-react';
-import type { ChatGroup, ChatSession, Message, ModelInfo, WorkspaceInfo } from './types';
-import { getTimeGroupLabel, getTimeGroupOrder, toChatSession } from './chatUtils';
-import Sidebar from './Sidebar';
+import type { ChatGroup, ChatSession, Message, ModelInfo, WorkspaceInfo } from './types/types';
+import { 
+  getTimeGroupLabel, 
+  getTimeGroupOrder, 
+  toChatSession,
+  EMPTY_MESSAGES,
+  parseUserMessageForDisplay,
+  buildAttachmentPrompt,
+  isDraftSessionId,
+  createDraftChat
+} from './utils/chatUtils';
+import { useSettings } from './hooks/useSettings';
+import { useWorkspace } from './hooks/useWorkspace';
+import { useModels } from './hooks/useModels';
+import { useChat } from './hooks/useChat';
+import Sidebar from './components/sidebar/Sidebar';
 
-const SettingsPanel = lazy(() => import('./SettingsPanel'));
-const ChatMessage = lazy(() => import('./ChatMessage'));
-const XtermTerminal = lazy(() => import('./XtermTerminal'));
+const SettingsPanel = lazy(() => import('./components/settings/SettingsPanel'));
+const ChatMessage = lazy(() => import('./components/chat/ChatMessage'));
+const XtermTerminal = lazy(() => import('./components/terminal/XtermTerminal'));
 
-const EMPTY_MESSAGES: Message[] = [];
-const DRAFT_SESSION_ID_PREFIX = 'draft-session-';
-const ATTACHMENT_BLOCK_RE = /^<blankai-attachment-v1>\n([\s\S]*?)\n<\/blankai-attachment-v1>\n*/;
-const LEGACY_ATTACHMENT_RE = /^\[用户附带了(?<kind>图片|文本文件|文件)(?:: (?<legacyName>[^，]+))?，(?<pathHint>[^\]]+)\]\n*/;
-const V1_ATTACHMENT_DESCRIPTION_RE = /^用户附带了(?<label>一张图片|一个文本文件|一个文件)。\n文件名: (?<name>[^\n]+)(?:\n本地路径: (?<path>[^\n]+))?(?:\nMIME 类型: (?<type>[^\n]+))?(?:\n大小: (?<size>\d+) bytes)?(?:\n\n文件内容如下:\n```[\s\S]*?\n```\n)?\n*/;
-
-function parseUserMessageForDisplay(rawText: string): { text: string; attachment?: Message['attachment'] } {
-  const blockMatch = rawText.match(ATTACHMENT_BLOCK_RE);
-  if (blockMatch) {
-    try {
-      const meta = JSON.parse(blockMatch[1]);
-      const afterBlock = rawText.slice(blockMatch[0].length).trimStart();
-      const descriptionMatch = afterBlock.match(V1_ATTACHMENT_DESCRIPTION_RE);
-      const text = (descriptionMatch
-        ? afterBlock.slice(descriptionMatch[0].length)
-        : afterBlock
-      ).trimStart();
-      return {
-        text,
-        attachment: {
-          name: meta.name || (meta.path ? meta.path.split(/[\\/]/).pop() : 'attachment'),
-          type: meta.type || '',
-          path: meta.path,
-          size: meta.size,
-          kind: meta.kind
-        }
-      };
-    } catch {
-      return { text: rawText };
-    }
-  }
-
-  const legacyMatch = rawText.match(LEGACY_ATTACHMENT_RE);
-  if (legacyMatch?.groups) {
-    const pathHint = legacyMatch.groups.pathHint || '';
-    const savedPath = pathHint.match(/已保存至[:：]\s*(.+)$/)?.[1]?.trim();
-    const legacyName = legacyMatch.groups.legacyName || savedPath?.split(/[\\/]/).pop() || 'attachment';
-    return {
-      text: rawText.slice(legacyMatch[0].length).trimStart(),
-      attachment: {
-        name: legacyName,
-        type: legacyMatch.groups.kind === '图片' ? 'image/*' : '',
-        path: savedPath,
-        kind: legacyMatch.groups.kind === '图片' ? 'image' : legacyMatch.groups.kind === '文本文件' ? 'text' : 'file'
-      }
-    };
-  }
-
-  return { text: rawText };
-}
-
-function buildAttachmentPrompt(meta: NonNullable<Message['attachment']>, text: string, textContent: string | null) {
-  const description = [
-    `用户附带了${meta.kind === 'image' ? '一张图片' : meta.kind === 'text' ? '一个文本文件' : '一个文件'}。`,
-    `文件名: ${meta.name}`,
-    meta.path ? `本地路径: ${meta.path}` : null,
-    meta.type ? `MIME 类型: ${meta.type}` : null,
-    typeof meta.size === 'number' ? `大小: ${meta.size} bytes` : null,
-  ].filter(Boolean).join('\n');
-
-  const fileExtension = meta.name.split('.').pop() || '';
-  const inlineText = textContent !== null
-    ? `\n\n文件内容如下:\n\`\`\`${fileExtension}\n${textContent}\n\`\`\``
-    : '';
-
-  const block = `<blankai-attachment-v1>\n${JSON.stringify({
-    ...meta,
-    prompt: `${description}${inlineText}`
-  })}\n</blankai-attachment-v1>`;
-  return `${block}\n${text}`;
-}
-
-function isDraftSessionId(sessionId: string | null | undefined) {
-  return !!sessionId && sessionId.startsWith(DRAFT_SESSION_ID_PREFIX);
-}
-
-function createDraftChat(workspace: WorkspaceInfo | null): ChatSession {
-  const now = Date.now();
-  return {
-    id: `${DRAFT_SESSION_ID_PREFIX}${now}`,
-    preview: '新对话',
-    messages: [],
-    updatedAt: now,
-    workspacePath: workspace?.path ?? null,
-    workspaceName: workspace?.name ?? '空文件夹',
-  };
-}
 
 export default function App() {
-  const showThinking = (() => {
-    try {
-      const stored = localStorage.getItem('blankAI_showThinking');
-      return stored ? JSON.parse(stored) !== false : true;
-    } catch {
-      return true;
-    }
-  })();
+  const {
+    showThinking,
+    sidebarWidth,
+    setSidebarWidth,
+    groupProcessBlocks,
+    collapseProcess,
+    collapseTools,
+    processDisplayOrder,
+    collapsedGroups,
+    toggleGroupCollapse
+  } = useSettings();
 
-  const readBooleanSetting = (key: string, fallback: boolean) => {
-    try {
-      const stored = localStorage.getItem(key);
-      return stored ? JSON.parse(stored) !== false : fallback;
-    } catch {
-      return fallback;
-    }
-  };
-
-  const readStringSetting = (key: string, fallback: string) => {
-    try {
-      const stored = localStorage.getItem(key);
-      return stored ? JSON.parse(stored) || fallback : fallback;
-    } catch {
-      return fallback;
-    }
-  };
-
-  const [currentWorkspace, setCurrentWorkspace] = useState<WorkspaceInfo | null>(() => {
-    try {
-      const stored = localStorage.getItem('blankAI_currentWorkspace');
-      if (stored) {
-        const workspace = JSON.parse(stored);
-        if (workspace?.path && workspace?.name) return workspace;
-      }
-    } catch (e) {
-      console.error('Failed to parse blankAI_currentWorkspace on init:', e);
-    }
-    return null;
-  });
-
-  const [savedChats, setSavedChats] = useState<ChatSession[]>(() => {
-    try {
-      const saveHistory = localStorage.getItem('blankAI_saveHistory') !== 'false';
-      if (saveHistory) {
-        const stored = localStorage.getItem('blankAI_savedChats');
-        if (stored) {
-          const chats = JSON.parse(stored);
-          if (Array.isArray(chats)) return chats;
-        }
-      }
-    } catch (e) {
-      console.error('Failed to parse blankAI_savedChats on init:', e);
-    }
-    return [];
-  });
-
-  const [currentSessionId, setCurrentSessionId] = useState<string | null>(() => {
-    try {
-      const saveHistory = localStorage.getItem('blankAI_saveHistory') !== 'false';
-      if (saveHistory) {
-        const stored = localStorage.getItem('blankAI_savedChats');
-        if (stored) {
-          const chats = JSON.parse(stored);
-          if (Array.isArray(chats) && chats.length > 0) {
-            return typeof chats[0].id === 'string' ? chats[0].id : null;
-          }
-        }
-      }
-    } catch {}
-    return null;
-  });
-
+  const { currentWorkspace, setCurrentWorkspace, currentWorkspaceRef, selectWorkspaceFolder } = useWorkspace();
+  const { savedChats, setSavedChats, currentSessionId, setCurrentSessionId, currentSessionIdRef, activeAgentSessionIdRef, userNavigatedRef, isTyping, setIsTyping, loadChat, startNewChat, renameChat, togglePinChat, deleteChat, toggleMessageHistory, ensurePtyMatchesCurrentChat } = useChat({ currentWorkspace, setCurrentWorkspace });
+  const { models, currentModel, setCurrentModel, isModelDropdownOpen, setIsModelDropdownOpen, thinkingLevel, setThinkingLevel, popoverView, setPopoverView } = useModels(currentSessionId);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-  const [sidebarWidth, setSidebarWidth] = useState(() => {
-    try {
-      const stored = localStorage.getItem('blankAI_sidebarWidth');
-      return stored ? parseInt(stored, 10) : 300;
-    } catch {
-      return 300;
-    }
-  });
-
-  useEffect(() => {
-    localStorage.setItem('blankAI_sidebarWidth', sidebarWidth.toString());
-  }, [sidebarWidth]);
 
   // Global ESC to interrupt
   useEffect(() => {
@@ -195,12 +52,8 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleGlobalKeyDown);
   }, []);
 
-  const [groupProcessBlocks, setGroupProcessBlocks] = useState(() => readBooleanSetting('blankAI_groupProcessBlocks', true));
-  const [collapseProcess, setCollapseProcess] = useState(() => readBooleanSetting('blankAI_collapseProcess', true));
-  const [collapseTools, setCollapseTools] = useState(() => readBooleanSetting('blankAI_collapseTools', true));
-  const [processDisplayOrder, setProcessDisplayOrder] = useState(() => readStringSetting('blankAI_processDisplayOrder', 'tool-first'));
+
   const [inputText, setInputText] = useState('');
-  const [isTyping, setIsTyping] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -211,80 +64,9 @@ export default function App() {
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const [chatMenu, setChatMenu] = useState<{ chatId: string; x: number; y: number } | null>(null);
 
-  const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>(() => {
-    try {
-      const stored = localStorage.getItem('blankAI_collapsedGroups');
-      return stored ? JSON.parse(stored) : {};
-    } catch {
-      return {};
-    }
-  });
 
-  useEffect(() => {
-    localStorage.setItem('blankAI_collapsedGroups', JSON.stringify(collapsedGroups));
-  }, [collapsedGroups]);
 
-  useEffect(() => {
-    const handleSettingsChange = (event: Event) => {
-      const detail = (event as CustomEvent<{ key?: string; value?: boolean }>).detail;
-      if (detail?.key === 'blankAI_groupProcessBlocks') {
-        setGroupProcessBlocks(detail.value !== false);
-      } else if (detail?.key === 'blankAI_collapseProcess') {
-        setCollapseProcess(detail.value !== false);
-      } else if (detail?.key === 'blankAI_collapseTools') {
-        setCollapseTools(detail.value !== false);
-      } else if (detail?.key === 'blankAI_processDisplayOrder') {
-        setProcessDisplayOrder(String(detail.value || 'tool-first'));
-      }
-    };
 
-    const handleStorageChange = (event: StorageEvent) => {
-      if (event.key === 'blankAI_groupProcessBlocks') {
-        setGroupProcessBlocks(readBooleanSetting('blankAI_groupProcessBlocks', true));
-      } else if (event.key === 'blankAI_collapseProcess') {
-        setCollapseProcess(readBooleanSetting('blankAI_collapseProcess', true));
-      } else if (event.key === 'blankAI_collapseTools') {
-        setCollapseTools(readBooleanSetting('blankAI_collapseTools', true));
-      } else if (event.key === 'blankAI_processDisplayOrder') {
-        setProcessDisplayOrder(readStringSetting('blankAI_processDisplayOrder', 'tool-first'));
-      }
-    };
-
-    window.addEventListener('blankAI-settings-change', handleSettingsChange);
-    window.addEventListener('storage', handleStorageChange);
-    return () => {
-      window.removeEventListener('blankAI-settings-change', handleSettingsChange);
-      window.removeEventListener('storage', handleStorageChange);
-    };
-  }, []);
-
-  const toggleGroupCollapse = (key: string) => {
-    setCollapsedGroups(prev => ({
-      ...prev,
-      [key]: !prev[key]
-    }));
-  };
-
-  // Persistence effect for savedChats
-  useEffect(() => {
-    try {
-      const saveHistory = localStorage.getItem('blankAI_saveHistory') !== 'false';
-      if (saveHistory) {
-        localStorage.setItem('blankAI_savedChats', JSON.stringify(savedChats));
-      } else {
-        localStorage.removeItem('blankAI_savedChats');
-      }
-    } catch (e) {
-      console.error('Failed to persist savedChats to localStorage:', e);
-    }
-  }, [savedChats]);
-  
-  // Model & Thinking States
-  const [models, setModels] = useState<ModelInfo[]>([]);
-  const [currentModel, setCurrentModel] = useState<ModelInfo | null>(null);
-  const [isModelDropdownOpen, setIsModelDropdownOpen] = useState(false);
-  const [thinkingLevel, setThinkingLevel] = useState<string>('high');
-  const [popoverView, setPopoverView] = useState<'main' | 'models'>('main');
 
   // Translation helpers for thinking levels
   const getThinkingLabel = (level: string) => {
@@ -315,33 +97,9 @@ export default function App() {
   const inputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const formRef = useRef<HTMLFormElement>(null);
-  const currentSessionIdRef = useRef<string | null>(null);
-  const activeAgentSessionIdRef = useRef<string | null>(null);
-  const pendingDraftSessionIdRef = useRef<string | null>(null);
   const isSendingRef = useRef<boolean>(false);
-  const currentWorkspaceRef = useRef<WorkspaceInfo | null>(currentWorkspace);
-  const processedEntryIdsRef = useRef<Set<string>>(new Set());
-  // Tracks whether the user has explicitly navigated — blocks backend pushes from hijacking the view
-  // Tracks whether the user has explicitly navigated — blocks backend pushes from hijacking the view
-  const userNavigatedRef = useRef<boolean>(false);
 
-  // Keep the ref in sync with currentSessionId
-  useEffect(() => {
-    currentSessionIdRef.current = currentSessionId;
-  }, [currentSessionId]);
 
-  useEffect(() => {
-    currentWorkspaceRef.current = currentWorkspace;
-    try {
-      if (currentWorkspace) {
-        localStorage.setItem('blankAI_currentWorkspace', JSON.stringify(currentWorkspace));
-      } else {
-        localStorage.removeItem('blankAI_currentWorkspace');
-      }
-    } catch (e) {
-      console.error('Failed to persist current workspace:', e);
-    }
-  }, [currentWorkspace]);
 
   // Apply dark mode theme class on <html>
   useEffect(() => {
@@ -364,99 +122,7 @@ export default function App() {
     };
   }, []);
 
-  // Restore workspace and listen for PTY session state on mount
-  useEffect(() => {
-    const api = (window as any).api;
-    if (!api) return;
 
-    const cleanups: (() => void)[] = [];
-
-    // Restore workspace folder
-    if (currentWorkspace?.path && api.setWorkspaceFolder) {
-      api.setWorkspaceFolder(currentWorkspace.path, { startPty: false }).catch((e: unknown) => {
-        console.error('Failed to restore workspace folder:', e);
-      });
-    }
-
-    // Fetch full model list from CLI
-    const fetchModels = () => {
-      if (api.getAvailableModels) {
-        api.getAvailableModels().then((models: ModelInfo[]) => {
-          if (models.length > 0) setModels(models);
-        }).catch((e: unknown) => {
-          console.error('Failed to fetch models:', e);
-        });
-      }
-    };
-    fetchModels();
-
-    const handleProvidersUpdated = () => fetchModels();
-    window.addEventListener('providers-updated', handleProvidersUpdated);
-    cleanups.push(() => window.removeEventListener('providers-updated', handleProvidersUpdated));
-
-    if (api.listSessions) {
-      api.listSessions().then((sessions: any[]) => {
-        if (!Array.isArray(sessions)) return;
-        const cliChats = sessions.map(toChatSession);
-        setSavedChats(prev => {
-          const drafts = prev.filter(chat => isDraftSessionId(chat.id) && !chat.sessionPath);
-          return [...cliChats, ...drafts];
-        });
-        if (cliChats.length > 0) {
-          setCurrentSessionId(prev => {
-            if (prev && (cliChats.some(chat => chat.id === prev) || isDraftSessionId(prev))) return prev;
-            return cliChats[0].id;
-          });
-        }
-      }).catch((e: unknown) => {
-        console.error('Failed to load CLI sessions:', e);
-      });
-    }
-
-    if (api.onSessionModelChange) {
-      const unsub = api.onSessionModelChange((data: { id: string; provider: string }) => {
-        const newModel: ModelInfo = { id: data.id, name: data.id, provider: data.provider };
-        setCurrentModel(newModel);
-      });
-      cleanups.push(unsub);
-    }
-
-    if (api.onSessionThinkingLevelChange) {
-      const unsub = api.onSessionThinkingLevelChange((data: { thinkingLevel: string }) => {
-        if (data.thinkingLevel) setThinkingLevel(data.thinkingLevel);
-      });
-      cleanups.push(unsub);
-    }
-
-    return () => cleanups.forEach(fn => fn());
-  }, []);
-
-  useEffect(() => {
-    const fetchThinking = async () => {
-      const chat = savedChats.find(c => c.id === currentSessionId);
-      if (chat?.sessionPath) {
-        const api = (window as any).api;
-        if (api?.getSessionThinkingLevel) {
-          const level = await api.getSessionThinkingLevel(chat.sessionPath);
-          if (level) setThinkingLevel(level);
-        }
-      }
-    };
-    fetchThinking();
-  }, [currentSessionId, savedChats]);
-
-  // Close model dropdown when clicking outside
-  useEffect(() => {
-    if (!isModelDropdownOpen) return;
-    const handleOutsideClick = (e: MouseEvent) => {
-      const target = e.target as HTMLElement;
-      if (!target.closest('.model-selector-container')) {
-        setIsModelDropdownOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', handleOutsideClick);
-    return () => document.removeEventListener('mousedown', handleOutsideClick);
-  }, [isModelDropdownOpen]);
 
   const currentChat = savedChats.find(c => c.id === currentSessionId);
   const messages = currentChat ? currentChat.messages : EMPTY_MESSAGES;
@@ -530,76 +196,7 @@ export default function App() {
     setIsSidebarOpen(show);
   };
 
-  const loadChat = async (id: string) => {
-    userNavigatedRef.current = true;
-    setCurrentSessionId(id);
-    currentSessionIdRef.current = id;
-    const chat = savedChats.find(c => c.id === id);
-    if (chat) {
-      if (chat.workspacePath && chat.workspaceName) {
-        if (currentWorkspaceRef.current?.path !== chat.workspacePath) {
-          setCurrentWorkspace({ path: chat.workspacePath, name: chat.workspaceName });
-        }
-      } else {
-        setCurrentWorkspace(null);
-      }
-      const api = (window as any).api;
-      if (api?.openSession && chat.sessionPath) {
-        const result = await api.openSession(chat.sessionPath);
-        if (!result?.success) {
-          console.warn('Failed to open CLI session:', result?.error);
-        }
-      }
-    }
-    if (window.innerWidth < 768) {
-      toggleSidebar(false);
-    }
-  };
 
-  const normalizePath = (value?: string | null) => {
-    return value ? value.replace(/\\/g, '/').toLowerCase() : '';
-  };
-
-  const ensurePtyMatchesCurrentChat = async (draftChat?: ChatSession) => {
-    const api = (window as any).api;
-    if (!api) return;
-
-    const activeId = currentSessionIdRef.current;
-    const chat = draftChat || (activeId ? savedChats.find(c => c.id === activeId) : null);
-
-    if (chat && isDraftSessionId(chat.id)) {
-      if (api.newSession) {
-        const result = await api.newSession(chat.workspacePath || currentWorkspaceRef.current?.path || null);
-        if (!result?.success) {
-          console.warn('Failed to create a fresh PTY session for draft chat:', result?.error);
-        }
-      }
-      return;
-    }
-
-    if (chat?.sessionPath && api.openSession) {
-      const status = api.getPtyStatus ? await api.getPtyStatus() : null;
-      if (normalizePath(status?.sessionPath) === normalizePath(chat.sessionPath)) return;
-
-      activeAgentSessionIdRef.current = chat.id;
-      const result = await api.openSession(chat.sessionPath);
-      if (!result?.success) {
-        console.warn('Failed to sync PTY to current chat:', result?.error);
-      }
-      return;
-    }
-
-    if (currentWorkspaceRef.current?.path && api.setWorkspaceFolder) {
-      await api.setWorkspaceFolder(currentWorkspaceRef.current.path, { startPty: false });
-    }
-
-    if (api.startPty) {
-      const result = await api.startPty();
-      if (!result?.success) {
-        console.warn('Failed to start PTY:', result?.error);
-      }
-    }
-  };
 
   const toggleTerminalMode = async () => {
     if (showTerminalMode) {
@@ -612,23 +209,7 @@ export default function App() {
     setShowTerminalMode(true);
   };
 
-  const renameChat = (chat: ChatSession) => {
-    const nextName = window.prompt('重命名对话', chat.preview);
-    if (!nextName) return;
-    const trimmedName = nextName.trim();
-    if (!trimmedName) return;
-    setSavedChats(prev => prev.map(item =>
-      item.id === chat.id ? { ...item, preview: trimmedName } : item
-    ));
-    setChatMenu(null);
-  };
 
-  const togglePinChat = (chat: ChatSession) => {
-    setSavedChats(prev => prev.map(item =>
-      item.id === chat.id ? { ...item, pinned: !item.pinned } : item
-    ));
-    setChatMenu(null);
-  };
 
   const shareChat = async (chat: ChatSession) => {
     const text = chat.sessionPath
@@ -643,75 +224,7 @@ export default function App() {
     setChatMenu(null);
   };
 
-  const deleteChat = async (e: React.MouseEvent | null, id: string) => {
-    e?.stopPropagation();
-    const chat = savedChats.find(c => c.id === id);
-    if (!chat) return;
-    const confirmed = window.confirm(`删除「${chat.preview}」？\n\n这会删除本地会话文件。`);
-    if (!confirmed) {
-      setChatMenu(null);
-      return;
-    }
 
-    const api = (window as any).api;
-    if (chat.sessionPath && api?.deleteSession) {
-      const result = await api.deleteSession(chat.sessionPath);
-      if (!result?.success) {
-        window.alert(`删除失败：${result?.error || '未知错误'}`);
-        setChatMenu(null);
-        return;
-      }
-    }
-
-    setSavedChats(prev => prev.filter(c => c.id !== id));
-    if (currentSessionId === id) {
-      setCurrentSessionId(null);
-      currentSessionIdRef.current = null;
-    }
-    setChatMenu(null);
-  };
-
-  const startNewChat = async () => {
-    const api = (window as any).api;
-    const workspacePath = currentWorkspaceRef.current?.path ?? null;
-    const draftChat = createDraftChat(currentWorkspaceRef.current);
-    pendingDraftSessionIdRef.current = draftChat.id;
-    userNavigatedRef.current = true;
-    setSavedChats(prev => {
-      const withoutOldDrafts = prev.filter(chat => !isDraftSessionId(chat.id) || chat.sessionPath);
-      return [draftChat, ...withoutOldDrafts];
-    });
-    setCurrentSessionId(draftChat.id);
-    currentSessionIdRef.current = draftChat.id;
-    activeAgentSessionIdRef.current = draftChat.id;
-    setIsTyping(false);
-    if (workspacePath && api?.setWorkspaceFolder) {
-      const result = await api.setWorkspaceFolder(workspacePath, { startPty: false });
-      if (result?.path) {
-        setCurrentWorkspace({ path: result.path, name: result.name || result.path });
-      }
-    } else if (!workspacePath) {
-      setCurrentWorkspace(null);
-    }
-    // Reset terminal if currently in terminal mode
-    if (showTerminalMode) {
-      await ensurePtyMatchesCurrentChat(draftChat);
-    }
-    setTimeout(() => {
-      inputRef.current?.focus();
-    }, 50);
-  };
-
-  const selectWorkspaceFolder = async () => {
-    const api = (window as any).api;
-    if (!api?.selectWorkspaceFolder) return;
-
-    const workspace = await api.selectWorkspaceFolder();
-    if (workspace?.path) {
-      setCurrentWorkspace(workspace);
-      setSearchQuery('');
-    }
-  };
 
   const closeContextMenu = () => {
     setContextMenu(null);
@@ -770,315 +283,7 @@ export default function App() {
     closeContextMenu();
   };
 
-  const toggleMessageHistory = (sessionId: string, messageId: string | undefined, index: number) => {
-    setSavedChats(prevChats => prevChats.map(chat => {
-      if (chat.id === sessionId) {
-        const newMessages = chat.messages.map((m, idx) => {
-          if ((m.id && m.id === messageId) || (!m.id && idx === index)) {
-            return { ...m, isHistoryOpen: !m.isHistoryOpen };
-          }
-          return m;
-        });
-        return { ...chat, messages: newMessages };
-      }
-      return chat;
-    }));
-  };
 
-  // ─── Session JSONL data handler (PTY mode) ─────────────────────
-  useEffect(() => {
-    const api = (window as any).api;
-    if (!api) return;
-
-    const cleanups: (() => void)[] = [];
-
-    // Handle full session messages (initial load or session change)
-    let lastLoadedWorkspace: string | null = null;
-    if (api.onSessionMessages) {
-      const unsub = api.onSessionMessages(({ sessionId, sessionPath, meta, messages: sessionMsgs }: { sessionId: string; sessionPath?: string; meta?: any; messages: any[] }) => {
-        console.log('[Session] Loaded messages:', sessionMsgs.length);
-
-        // Convert session messages to our Message format
-        const convertedMessages: Message[] = [];
-        for (const msg of sessionMsgs) {
-          if (msg.role === 'user') {
-            const display = parseUserMessageForDisplay(msg.text);
-            convertedMessages.push({
-              id: `session-user-${msg.id || msg.timestamp}`,
-              text: display.text,
-              sender: 'user',
-              attachment: display.attachment
-            });
-          } else if (msg.role === 'assistant') {
-            convertedMessages.push({
-              id: `session-ai-${msg.id || msg.timestamp}`,
-              text: msg.text,
-              thinking: msg.thinking || '',
-              sender: 'ai',
-              history: msg.toolCalls?.map((tc: any) => ({
-                type: 'tool',
-                toolCallId: tc.id,
-                toolName: tc.name,
-                toolArgs: JSON.stringify(tc.arguments),
-                isError: false
-              })) || [],
-              isHistoryOpen: !!msg.toolCalls?.length
-            });
-          } else if (msg.role === 'toolResult') {
-            // Find the last assistant message and update its tool history
-            const lastAi = convertedMessages.filter(m => m.sender === 'ai').pop();
-            if (lastAi && lastAi.history) {
-              const toolEntry = lastAi.history.find(
-                (h: any) => h.type === 'tool' && (
-                  (msg.toolCallId && h.toolCallId === msg.toolCallId) ||
-                  (!msg.toolCallId && h.toolName === msg.toolName)
-                )
-              );
-              if (toolEntry) {
-                toolEntry.result = msg.isError ? `[Error] ${msg.text}` : msg.text;
-                toolEntry.isError = msg.isError;
-                lastAi.isHistoryOpen = true;
-              }
-            }
-          }
-        }
-
-        const cliSessionId = sessionId;
-        const isSameSession = currentSessionIdRef.current === cliSessionId;
-        const isEmptySlate = currentSessionIdRef.current === null && !userNavigatedRef.current;
-        const isDraftSelection = isDraftSessionId(currentSessionIdRef.current);
-        const draftId = pendingDraftSessionIdRef.current;
-        const shouldReplaceDraft = isDraftSelection && !!draftId && currentSessionIdRef.current === draftId;
-        const shouldAdoptSession = isSameSession || isEmptySlate || shouldReplaceDraft;
-
-        // Only switch to this session if it is the one currently open,
-        // or if we have no session at all AND the user hasn't just navigated away.
-        if (shouldAdoptSession) {
-          setCurrentSessionId(cliSessionId);
-          currentSessionIdRef.current = cliSessionId;
-          activeAgentSessionIdRef.current = cliSessionId;
-          pendingDraftSessionIdRef.current = null;
-        }
-
-        const workspacePath = meta?.workspacePath ?? meta?.cwd ?? currentWorkspaceRef.current?.path ?? null;
-        const workspaceName = meta?.workspaceName ?? currentWorkspaceRef.current?.name ?? (workspacePath ? workspacePath.split(/[\\/]/).filter(Boolean).pop() : '空文件夹');
-        if ((isSameSession || isEmptySlate) && workspacePath) {
-          setCurrentWorkspace({ path: workspacePath, name: workspaceName });
-        }
-
-        const currentWorkspacePath = workspacePath;
-        const isWorkspaceChange = lastLoadedWorkspace !== null && lastLoadedWorkspace !== currentWorkspacePath;
-        lastLoadedWorkspace = currentWorkspacePath;
-
-        setSavedChats(prevChats => {
-          const existing = prevChats.find(c => c.id === cliSessionId);
-          const draftIndex = draftId ? prevChats.findIndex(c => c.id === draftId) : -1;
-          const preview = meta?.preview || convertedMessages.find(m => m.sender === 'user')?.text?.slice(0, 18) || '新对话';
-          const nextChat = {
-            id: cliSessionId,
-            preview: preview.length > 18 ? `${preview.substring(0, 18)}...` : preview,
-            messages: convertedMessages,
-            sessionPath: sessionPath ?? meta?.path,
-            updatedAt: meta?.updatedAt ?? Date.now(),
-            workspacePath,
-            workspaceName
-          };
-
-          if (existing) {
-            // Preserve optimistic local messages not yet confirmed by the backend
-            const convertedUserTexts = new Set(convertedMessages.filter(m => m.sender === 'user').map(m => m.text));
-            const pendingLocalMessages = existing.messages.filter(
-              m => m.sender === 'user' && m.id?.startsWith('local-user-') && !convertedUserTexts.has(m.text)
-            );
-            const mergedMessages = [...pendingLocalMessages, ...convertedMessages];
-            return prevChats
-              .filter(c => c.id !== draftId || c.id === cliSessionId)
-              .map(c => c.id === cliSessionId ? { ...c, ...nextChat, messages: mergedMessages } : c);
-          }
-
-          if (draftIndex >= 0) {
-            const next = [...prevChats];
-            next[draftIndex] = nextChat;
-            return next;
-          }
-
-          return [nextChat, ...prevChats];
-        });
-
-        const lastMsg = convertedMessages[convertedMessages.length - 1];
-        const isFinished = !lastMsg || (lastMsg.sender === 'ai' && (!lastMsg.history || lastMsg.history.length === 0));
-        setIsTyping(!isFinished && convertedMessages.length > 0);
-      });
-      cleanups.push(unsub);
-    }
-
-    // Handle individual session entries (real-time updates)
-    if (api.onSessionEntry) {
-      const unsub = api.onSessionEntry((entry: any) => {
-        if (entry.type !== 'message') return;
-        const { role, content } = entry.message;
-        // Dedup: skip already processed entries by ID
-        if (processedEntryIdsRef.current.has(entry.id)) return;
-        processedEntryIdsRef.current.add(entry.id);
-        if (processedEntryIdsRef.current.size > 10000) {
-          processedEntryIdsRef.current = new Set([...processedEntryIdsRef.current].slice(-5000));
-        }
-
-        const activeSessionId = String(entry._sessionId || currentSessionIdRef.current || '');
-        if (!activeSessionId) return;
-
-        const currentId = currentSessionIdRef.current;
-        const draftId = pendingDraftSessionIdRef.current;
-        const shouldAttachDraft = isDraftSessionId(currentId) && !!draftId && currentId === draftId;
-        const sessionPath = typeof entry._sessionPath === 'string' ? entry._sessionPath : undefined;
-        const resolveEntryChats = (
-          prevChats: ChatSession[],
-          apply: (chat: ChatSession) => ChatSession
-        ) => {
-          const workspacePath = currentWorkspaceRef.current?.path ?? null;
-          const workspaceName = currentWorkspaceRef.current?.name ?? null;
-          const normalizeChat = (chat: ChatSession): ChatSession => ({
-            ...chat,
-            id: activeSessionId,
-            sessionPath: sessionPath || chat.sessionPath,
-            workspacePath: chat.workspacePath ?? workspacePath,
-            workspaceName: chat.workspaceName ?? workspaceName
-          });
-          const targetIndex = prevChats.findIndex(chat => chat.id === activeSessionId || (shouldAttachDraft && chat.id === draftId));
-          if (targetIndex >= 0) {
-            let replacedTarget = false;
-            return prevChats.flatMap((chat, index) => {
-              const isTarget = index === targetIndex;
-              const isStaleDraft = shouldAttachDraft && chat.id === draftId && index !== targetIndex;
-              const isDuplicateReal = chat.id === activeSessionId && index !== targetIndex;
-              if (isStaleDraft || isDuplicateReal) return [];
-              if (!isTarget) return [chat];
-              replacedTarget = true;
-              return [apply(normalizeChat(chat))];
-            }).filter((chat, index, chats) => {
-              return chat.id !== activeSessionId || chats.findIndex(item => item.id === activeSessionId) === index || !replacedTarget;
-            });
-          }
-
-          return [apply({
-            id: activeSessionId,
-            preview: 'CLI Session',
-            messages: [],
-            sessionPath,
-            workspacePath,
-            workspaceName,
-            updatedAt: Date.now()
-          }), ...prevChats];
-        };
-
-        // Never let a background session entry hijack the user's current view.
-        // If the entry is for a different session than what's open, ignore it entirely.
-        if (currentId && currentId !== activeSessionId && !shouldAttachDraft) {
-          return;
-        }
-
-        if (shouldAttachDraft) {
-          setCurrentSessionId(activeSessionId);
-          currentSessionIdRef.current = activeSessionId;
-          activeAgentSessionIdRef.current = activeSessionId;
-          pendingDraftSessionIdRef.current = null;
-        }
-
-        if (role === 'user') {
-          const rawText = Array.isArray(content)
-            ? content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
-            : (typeof content === 'string' ? content : '');
-          const display = parseUserMessageForDisplay(rawText);
-          const text = display.text;
-
-          setSavedChats(prevChats => {
-            return resolveEntryChats(prevChats, chat => {
-              const recentUserMsgs = chat.messages.filter(m => m.sender === 'user').slice(-3);
-              const isDuplicate = recentUserMsgs.some(m => m.text === text);
-              if (isDuplicate) return chat;
-              return {
-                ...chat,
-                preview: chat.preview === '新对话' || chat.preview === 'CLI Session' ? (text.slice(0, 18) || chat.preview) : chat.preview,
-                messages: [...chat.messages, { id: `session-user-${entry.id}`, text, sender: 'user' as const, attachment: display.attachment }],
-                updatedAt: Date.now()
-              };
-            });
-          });
-        } else if (role === 'assistant') {
-          const blocks = Array.isArray(content) ? content : [];
-          let thinking = '';
-          let text = '';
-          const toolCalls: any[] = [];
-
-          for (const block of blocks) {
-            if (block.type === 'thinking') {
-              thinking += block.thinking || '';
-            } else if (block.type === 'text') {
-              text += block.text || '';
-            } else if (block.type === 'toolCall') {
-              toolCalls.push({
-                id: block.id,
-                name: block.name,
-                arguments: block.arguments
-              });
-            }
-          }
-          if (toolCalls.length === 0) {
-            setIsTyping(false);
-          }
-          setSavedChats(prevChats => {
-            return resolveEntryChats(prevChats, chat => {
-              if (chat.messages.some(m => m.id === `session-ai-${entry.id}`)) return chat;
-              const newMsg: Message = {
-                id: `session-ai-${entry.id}`,
-                text,
-                thinking,
-                sender: 'ai',
-                history: toolCalls.map(tc => ({
-                  type: 'tool',
-                  toolCallId: tc.id,
-                  toolName: tc.name,
-                  toolArgs: JSON.stringify(tc.arguments),
-                  isError: false
-                })),
-                isHistoryOpen: toolCalls.length > 0
-              };
-              return { ...chat, messages: [...chat.messages, newMsg], updatedAt: Date.now() };
-            });
-          });
-        } else if (role === 'toolResult') {
-          const resultText = Array.isArray(entry.message.content)
-            ? entry.message.content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
-            : '';
-
-          setSavedChats(prevChats => prevChats.map(chat => {
-            if (chat.id === activeSessionId) {
-              const newMessages = chat.messages.map((m, idx) => {
-                if (idx === chat.messages.length - 1 && m.sender === 'ai' && m.history) {
-                  const updatedHistory = m.history.map((h: any) => {
-                    const isMatchingTool = entry.message.toolCallId
-                      ? h.toolCallId === entry.message.toolCallId
-                      : h.toolName === entry.message.toolName;
-                    if (h.type === 'tool' && isMatchingTool && !h.result) {
-                      return { ...h, result: entry.message.isError ? `[Error] ${resultText}` : resultText, isError: entry.message.isError };
-                    }
-                    return h;
-                  });
-                  return { ...m, history: updatedHistory, isHistoryOpen: true };
-                }
-                return m;
-              });
-              return { ...chat, messages: newMessages };
-            }
-            return chat;
-          }));
-        }
-      });
-      cleanups.push(unsub);
-    }
-
-    return () => cleanups.forEach(fn => fn());
-  }, []);
 
   const handlePaste = (e: React.ClipboardEvent) => {
     const items = e.clipboardData?.items;
@@ -1237,17 +442,17 @@ export default function App() {
         chatMenu={chatMenu}
         savedChats={savedChats}
         onToggleSidebar={toggleSidebar}
-        onStartNewChat={startNewChat}
+        onStartNewChat={() => startNewChat(showTerminalMode)}
         onSelectWorkspaceFolder={selectWorkspaceFolder}
         onSearchChange={setSearchQuery}
         onToggleGroup={toggleGroupCollapse}
-        onLoadChat={loadChat}
+        onLoadChat={(id) => loadChat(id, window.innerWidth < 768, toggleSidebar)}
         onOpenChatMenu={setChatMenu}
         onOpenSettings={() => setIsSettingsOpen(true)}
         onRenameChat={renameChat}
         onTogglePinChat={togglePinChat}
         onShareChat={shareChat}
-        onDeleteChat={(id) => deleteChat(null, id)}
+        onDeleteChat={(id) => deleteChat(id)}
       />
 
       {/* Main Chat Area */}
@@ -1263,7 +468,7 @@ export default function App() {
                       <PanelLeft size={20} strokeWidth={1.5} />
                   </button>
                 )}
-                <button onClick={startNewChat} className="text-gray-400 hover:text-gray-800 transition-colors p-1 flex items-center justify-center" title="新建对话" style={{ WebkitAppRegion: 'no-drag' } as any}>
+                <button onClick={() => startNewChat(showTerminalMode)} className="text-gray-400 hover:text-gray-800 transition-colors p-1 flex items-center justify-center" title="新建对话" style={{ WebkitAppRegion: 'no-drag' } as any}>
                     <Plus size={20} strokeWidth={1.5} />
                 </button>
                 <button

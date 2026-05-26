@@ -76,6 +76,7 @@ function registerIpcHandlers(getMainWindow, ptyManager, sessionWatcher) {
   });
 
   ipcMain.handle('send-prompt', async (event, data) => {
+    console.log(`[IPC] send-prompt: len=${data ? data.length : 0}`);
     if (ptyManager.ptyProcess) {
       ptyManager.writePromptToPty(data);
       return { success: true };
@@ -89,6 +90,7 @@ function registerIpcHandlers(getMainWindow, ptyManager, sessionWatcher) {
   });
 
   ipcMain.handle('send-pi-command', async (event, command) => {
+    console.log(`[IPC] send-pi-command`);
     const text = (() => {
       if (typeof command === 'string') {
         try {
@@ -116,6 +118,7 @@ function registerIpcHandlers(getMainWindow, ptyManager, sessionWatcher) {
   });
 
   ipcMain.handle('send-keybinding', async (event, keyName) => {
+    console.log(`[IPC] send-keybinding: ${keyName}`);
     if (!ptyManager.ptyProcess) return { success: false, error: 'PTY is not running' };
     const keyMap = {
       'model-cycle': '\x10',
@@ -129,6 +132,7 @@ function registerIpcHandlers(getMainWindow, ptyManager, sessionWatcher) {
   });
 
   ipcMain.handle('select-model', async (event, model) => {
+    console.log(`[IPC] select-model: ${model?.provider}/${model?.id || model?.modelId}`);
     const provider = String(model?.provider || '').trim();
     const modelId = String(model?.id || model?.modelId || '').trim();
     if (!provider || !modelId) {
@@ -145,6 +149,7 @@ function registerIpcHandlers(getMainWindow, ptyManager, sessionWatcher) {
   });
 
   ipcMain.handle('select-thinking-level', async (event, level) => {
+    console.log(`[IPC] select-thinking-level: ${level}`);
     const targetLevel = String(level || '').trim();
     const levels = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
     if (!levels.includes(targetLevel)) {
@@ -212,6 +217,7 @@ function registerIpcHandlers(getMainWindow, ptyManager, sessionWatcher) {
   });
 
   ipcMain.handle('open-session', async (event, sessionPath) => {
+    console.log(`[IPC] open-session: ${sessionPath}`);
     if (!sessionPath || typeof sessionPath !== 'string') {
       return { success: false, error: 'Missing session path' };
     }
@@ -233,6 +239,7 @@ function registerIpcHandlers(getMainWindow, ptyManager, sessionWatcher) {
   });
 
   ipcMain.handle('delete-session', async (event, sessionPath) => {
+    console.log(`[IPC] delete-session: ${sessionPath}`);
     if (!sessionPath || typeof sessionPath !== 'string') {
       return { success: false, error: 'Missing session path' };
     }
@@ -271,6 +278,7 @@ function registerIpcHandlers(getMainWindow, ptyManager, sessionWatcher) {
   });
 
   ipcMain.handle('new-session', async (event, workspacePath) => {
+    console.log(`[IPC] new-session: workspacePath=${workspacePath}`);
     try {
       const requestedPath = typeof workspacePath === 'string' && workspacePath
         ? path.resolve(workspacePath)
@@ -317,6 +325,7 @@ function registerIpcHandlers(getMainWindow, ptyManager, sessionWatcher) {
   });
 
   ipcMain.handle('select-workspace-folder', async () => {
+    console.log(`[IPC] select-workspace-folder: prompt user`);
     const mainWindow = getMainWindow();
     if (!mainWindow || mainWindow.isDestroyed()) return null;
 
@@ -340,6 +349,7 @@ function registerIpcHandlers(getMainWindow, ptyManager, sessionWatcher) {
   });
 
   ipcMain.handle('set-workspace-folder', async (event, folderPath, options = {}) => {
+    console.log(`[IPC] set-workspace-folder: ${folderPath}`);
     if (!folderPath || typeof folderPath !== 'string') return { success: false };
     try {
       const resolvedPath = path.resolve(folderPath);

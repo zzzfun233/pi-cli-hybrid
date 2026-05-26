@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { ChevronDown, ChevronRight, FolderOpen, MoreVertical, PanelLeft, Pencil, Pin, Plus, Search, Settings, Share2, Sparkles, Trash2 } from 'lucide-react';
-import type { ChatGroup, ChatSession } from './types';
-import { getRelativeTime } from './chatUtils';
+import type { ChatGroup, ChatSession } from '../../types/types';
+import { getRelativeTime } from '../../utils/chatUtils';
 
 interface ChatMenuState {
   chatId: string;

@@ -11,11 +11,11 @@ import {
   type SystemToolItem,
   mergeProvidersWithEnv,
   providersToEnv,
-} from './settingsConfig';
+} from '../../utils/settingsConfig';
 import GeneralSettingsTab from './GeneralSettingsTab';
 import PromptSettingsTab from './PromptSettingsTab';
 import { Toggle } from './settingsShared';
-import { genId, loadJSON, type McpServer, type SettingsTab, type Skill } from './settingsTypes';
+import { genId, loadJSON, type McpServer, type SettingsTab, type Skill } from '../../types/settingsTypes';
 import { McpForm, McpList, SkillForm, SkillList } from './SkillsSettingsTab';
 
 interface SettingsPanelProps {

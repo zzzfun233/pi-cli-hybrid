@@ -28,7 +28,7 @@ import tsx from 'react-syntax-highlighter/dist/esm/languages/prism/tsx';
 import typescript from 'react-syntax-highlighter/dist/esm/languages/prism/typescript';
 import yaml from 'react-syntax-highlighter/dist/esm/languages/prism/yaml';
 import vscDarkPlus from 'react-syntax-highlighter/dist/esm/styles/prism/vsc-dark-plus';
-import type { Message } from './types';
+import type { Message } from '../../types/types';
 
 SyntaxHighlighter.registerLanguage('bash', bash);
 SyntaxHighlighter.registerLanguage('sh', bash);

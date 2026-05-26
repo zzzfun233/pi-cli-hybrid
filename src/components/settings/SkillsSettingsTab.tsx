@@ -1,7 +1,7 @@
 import React, { useRef } from 'react';
 import { Pencil, Plug2, Plus, Sparkles, Trash2, FileUp, FolderUp } from 'lucide-react';
 import { Field, FormActions, Toggle } from './settingsShared';
-import { type McpServer, type Skill, genId } from './settingsTypes';
+import { type McpServer, type Skill, genId } from '../../types/settingsTypes';
 
 export function SkillList({ skills, setSkills, onEdit, onAdd, onDelete }: {
   skills: Skill[]; setSkills: React.Dispatch<React.SetStateAction<Skill[]>>;
