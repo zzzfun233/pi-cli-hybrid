@@ -169,3 +169,32 @@ npm run build
 3. **保持高可靠的 Exit Code**：提交代码或合并分支前，必须保证本地运行 `npm run build` 的返回值为 `0`。
 
 如有疑问，请随时为本项目提 PR。让我们共同维护 Blank AI 的优雅！💻✨
+
+---
+
+## 🤝 Contributors | 贡献者
+
+感谢所有为本项目做出贡献的开发者和 AI 助手！
+
+<table>
+  <tr>
+    <td align="center">
+      <a href="https://github.com/zzzfun233">
+        <img src="https://github.com/zzzfun233.png" width="80px;" alt="zzzfun233"/>
+        <br />
+        <sub><b>zzzfun233</b></sub>
+      </a>
+      <br />
+      <sub>🏗️ 项目创建者 & 核心开发</sub>
+    </td>
+    <td align="center">
+      <a href="https://claude.ai">
+        <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/7/78/Anthropic_logo.svg/1200px-Anthropic_logo.svg.png" width="80px;" alt="Claude"/>
+        <br />
+        <sub><b>Claude (Anthropic)</b></sub>
+      </a>
+      <br />
+      <sub>🤖 AI 助手 & 代码协作</sub>
+    </td>
+  </tr>
+</table>
