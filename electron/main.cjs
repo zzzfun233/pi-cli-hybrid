@@ -6,7 +6,7 @@ dotenv.config({ path: path.join(__dirname, '../.env') });
 
 const SessionWatcher = require('./session-watcher.cjs');
 const PtyManager = require('./pty-manager.cjs');
-const { registerIpcHandlers } = require('./ipc-handlers.cjs');
+const { registerIpcHandlers } = require('./ipc/index.cjs');
 
 let mainWindow;
 
